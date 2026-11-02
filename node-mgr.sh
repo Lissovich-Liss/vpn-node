@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v3.2.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v3.2.1 (node-mgr)
 #  RemnawaveNode • Caddy Selfsteal • UFW (Strict Panel ACL) • Fail2ban
 #  Integrated 27-Point Node Diagnostic & Kernel/NIC/RPS/MSS/Zram Optimizer
 # ==============================================================================
@@ -29,7 +29,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.2.1"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
 
@@ -107,7 +107,7 @@ OS=""
 PKG_MANAGER=""
 
 # ═══════════════════════════════════════════════════════════════════
-#  UI-примитивы (стиль Case211/node-diagnostic + палитра LissVPN)
+#  UI-примитивы
 # ═══════════════════════════════════════════════════════════════════
 log_info()    { echo -e "  ${ORANGE}${BOLD}ℹ${NC}  ${WHITE}$*${NC}"; }
 log_success() { echo -e "  ${GREEN}${BOLD}✔${NC}  ${WHITE}$*${NC}"; }
@@ -126,7 +126,7 @@ box_top() {
     local title="$1"
     local tlen=${#title}
     local pad=$(( ND_BOX_W - tlen - 5 ))
-    [ $pad -lt 2 ] && pad=2
+    if [ $pad -lt 2 ]; then pad=2; fi
     printf "  %s┌─ %s%s%s " "${GRAPHITE}" "${ORANGE}${BOLD}" "$title" "${NC}${GRAPHITE}"
     for ((i=1; i<=pad; i++)); do printf "─"; done
     printf "┐%s\n" "${NC}"
@@ -160,7 +160,7 @@ detect_virt() {
     local v="bare-metal"
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         v=$(systemd-detect-virt 2>/dev/null || echo "bare-metal")
-        [ "$v" = "none" ] && v="bare-metal"
+        if [ "$v" = "none" ]; then v="bare-metal"; fi
     fi
     echo "$v"
 }
@@ -341,7 +341,7 @@ prompt_yn() {
 
     if [ "${NON_INTERACTIVE:-false}" = true ]; then
         local val="${config_val:-$default}"
-        [[ "$val" =~ ^[Yy]$ ]] && return 0 || return 1
+        if [[ "$val" =~ ^[Yy]$ ]]; then return 0; else return 1; fi
     fi
 
     while true; do
@@ -361,17 +361,16 @@ prompt_yn() {
 # ═══════════════════════════════════════════════════════════════════
 detect_os() {
     if [ -f /etc/lsb-release ]; then
-        OS=$(lsb_release -si)
+        OS=$(lsb_release -si 2>/dev/null || grep -E '^DISTRIB_ID=' /etc/lsb-release | cut -d= -f2 | tr -d '"')
     elif [ -f /etc/os-release ]; then
         OS=$(awk -F= '/^NAME=/{print $2}' /etc/os-release | tr -d '"')
-        [[ "$OS" == "Amazon Linux" ]] && OS="Amazon"
+        if [[ "$OS" == "Amazon Linux"* ]]; then OS="Amazon"; fi
     elif [ -f /etc/redhat-release ]; then
         OS=$(awk '{print $1}' /etc/redhat-release)
     elif [ -f /etc/arch-release ]; then
         OS="Arch"
     else
-        log_error "Неподдерживаемая операционная система"
-        exit 1
+        OS="Linux"
     fi
 }
 
@@ -410,17 +409,22 @@ detect_package_manager() {
     elif [[ "$OS" == "Arch"* ]]; then
         PKG_MANAGER="pacman"
     else
-        log_error "Неподдерживаемая ОС: $OS"
-        exit 1
+        PKG_MANAGER="apt-get"
     fi
 }
 
 _init_env() {
     check_root
     self_install
-    [ -z "$NODE_IP" ] && NODE_IP=$(get_server_ip)
-    [ -z "$OS" ] && detect_os
-    [ -z "$PKG_MANAGER" ] && detect_package_manager
+    if [ -z "${NODE_IP:-}" ]; then
+        NODE_IP=$(get_server_ip)
+    fi
+    if [ -z "${OS:-}" ]; then
+        detect_os
+    fi
+    if [ -z "${PKG_MANAGER:-}" ]; then
+        detect_package_manager
+    fi
 }
 
 is_dpkg_locked() {
@@ -432,7 +436,8 @@ is_dpkg_locked() {
     fi
     if command -v fuser >/dev/null 2>&1; then
         if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-           fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+           fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+           fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
             return 0
         fi
     fi
@@ -442,11 +447,11 @@ is_dpkg_locked() {
 wait_for_dpkg_lock() {
     local max_wait=180
     local waited=0
-    ! is_dpkg_locked && return 0
+    if ! is_dpkg_locked; then return 0; fi
     log_warning "Ожидание освобождения пакетного менеджера APT..."
     while [ $waited -lt $max_wait ]; do
         if ! is_dpkg_locked; then
-            dpkg --configure -a >/dev/null 2>&1 && return 0
+            if dpkg --configure -a >/dev/null 2>&1; then return 0; fi
         fi
         sleep 3
         waited=$((waited + 3))
@@ -455,22 +460,24 @@ wait_for_dpkg_lock() {
 }
 
 ensure_package_manager_available() {
-    [[ "$PKG_MANAGER" != "apt-get" ]] && return 0
+    if [[ "$PKG_MANAGER" != "apt-get" ]]; then return 0; fi
     local services_to_stop=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
     for svc in "${services_to_stop[@]}"; do
-        systemctl is-active --quiet "$svc" 2>/dev/null && systemctl stop "$svc" 2>/dev/null || true
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null || true
+        fi
     done
     if is_dpkg_locked; then
-        wait_for_dpkg_lock || {
+        if ! wait_for_dpkg_lock; then
             killall unattended-upgr apt-get apt 2>/dev/null || true
             rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null || true
             dpkg --configure -a >/dev/null 2>&1 || true
-        }
+        fi
     fi
 }
 
 restore_auto_updates() {
-    [[ "${PKG_MANAGER:-}" != "apt-get" ]] && return 0
+    if [[ "${PKG_MANAGER:-}" != "apt-get" ]]; then return 0; fi
     systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 }
 
@@ -481,27 +488,34 @@ install_package() {
     local ok=false
 
     if [[ "$PKG_MANAGER" == "apt-get" ]]; then
-        is_dpkg_locked && wait_for_dpkg_lock
+        if is_dpkg_locked; then wait_for_dpkg_lock; fi
         if [ "${_APT_UPDATED:-}" != "true" ]; then
             DEBIAN_FRONTEND=noninteractive apt-get update -qq >"$install_log" 2>&1 || true
             _APT_UPDATED=true
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$package" >>"$install_log" 2>&1 && ok=true
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$package" >>"$install_log" 2>&1; then
+            ok=true
+        fi
     elif [[ "$PKG_MANAGER" == "yum" ]] || [[ "$PKG_MANAGER" == "dnf" ]]; then
-        $PKG_MANAGER install -y -q "$package" >"$install_log" 2>&1 && ok=true
+        if $PKG_MANAGER install -y -q "$package" >"$install_log" 2>&1; then
+            ok=true
+        fi
     elif [[ "$PKG_MANAGER" == "pacman" ]]; then
-        pacman -S --noconfirm --quiet "$package" >"$install_log" 2>&1 && ok=true
+        if pacman -S --noconfirm --quiet "$package" >"$install_log" 2>&1; then
+            ok=true
+        fi
     fi
 
     rm -f "$install_log"
-    [ "$ok" = true ] && return 0 || return 1
+    if [ "$ok" = true ]; then return 0; else return 1; fi
 }
 
 install_base_utilities() {
+    log_info "Проверка и установка базовых системных утилит..."
     local -a required=("curl" "wget" "openssl" "tar" "jq" "ethtool" "iproute2")
     for pkg in "${required[@]}"; do
         local bin="$pkg"
-        [ "$pkg" = "iproute2" ] && bin="ss"
+        if [ "$pkg" = "iproute2" ]; then bin="ss"; fi
         if ! command -v "$bin" >/dev/null 2>&1; then
             install_package "$pkg" >/dev/null 2>&1 || true
         fi
@@ -527,7 +541,7 @@ backup_existing_config() {
     if [ -d "$dir" ]; then
         mkdir -p "$backup_dir"
         for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile; do
-            [ -f "$f" ] && cp -f "$f" "$backup_dir/" 2>/dev/null || true
+            if [ -f "$f" ]; then cp -f "$f" "$backup_dir/" 2>/dev/null || true; fi
         done
         chmod 700 "$backup_dir"
         log_info "Бэкап сохранен: $backup_dir"
@@ -540,8 +554,8 @@ load_config_file() {
         log_info "Загрузка конфигурации из $config_file"
         local _allowed_vars="CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
         while IFS='=' read -r key value; do
-            [[ "$key" =~ ^[[:space:]]*# ]] && continue
-            [[ -z "$key" ]] && continue
+            if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
+            if [ -z "$key" ]; then continue; fi
             key=$(echo "$key" | xargs)
             value="${value#\"}" ; value="${value%\"}"
             value="${value#\'}" ; value="${value%\'}"
@@ -561,7 +575,6 @@ run_diagnose() {
     local mode="${1:-full}"
     local pass_cnt=0 warn_cnt=0 fail_cnt=0
 
-    # Сброс файла находок
     cat > "$FINDINGS_FILE" << EOF
 # Generated by node-mgr diagnose on $(date -u +'%Y-%m-%dT%H:%M:%SZ')
 NEED_SYSCTL=0
@@ -601,7 +614,7 @@ EOF
         _chk_warn "01. CPU & Load Average" "Высокая нагрузка: LA ${load1} на ${cores} vCPU"
     fi
 
-    # [2] CPU Steal Time (проверка оверселлинга хостера)
+    # [2] CPU Steal Time
     local steal="0.0"
     if [ -r /proc/stat ]; then
         local s1 t1 s2 t2
@@ -611,7 +624,9 @@ EOF
         read -r _ u2 n2 sy2 id2 io2 ir2 so2 st2 _ < /proc/stat
         s2=${st2:-0}; t2=$((u2+n2+sy2+id2+io2+ir2+so2+s2))
         local dt=$((t2 - t1)) ds=$((s2 - s1))
-        [ $dt -gt 0 ] && steal=$(awk "BEGIN {printf \"%.1f\", ($ds * 100.0) / $dt}")
+        if [ $dt -gt 0 ]; then
+            steal=$(awk "BEGIN {printf \"%.1f\", ($ds * 100.0) / $dt}")
+        fi
     fi
     if awk "BEGIN {exit !($steal < 5.0)}"; then
         _chk_ok "02. CPU Steal Time" "${steal}% (хост не перегружен)"
@@ -685,13 +700,13 @@ EOF
         _mark_finding "NEED_SYSCTL"
     fi
 
-    # [8] Буферы сокетов BDP (rmem_max / wmem_max)
+    # [8] Буферы сокетов BDP
     local rmem_max
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
     if [ "$rmem_max" -ge 16777216 ]; then
         _chk_ok "08. Буферы сокетов BDP" "rmem_max = $((rmem_max / 1048576)) МБ"
     else
-        _chk_warn "08. Буферы сокетов BDP" "rmem_max = $((rmem_max / 1024)) КБ (узкое окно для 1Гбит/с+)"
+        _chk_warn "08. Буферы сокетов BDP" "rmem_max = $((rmem_max / 1024)) КБ (узкое окно)"
         _mark_finding "NEED_SYSCTL"
     fi
 
@@ -717,7 +732,7 @@ EOF
         _mark_finding "NEED_SYSCTL"
     fi
 
-    # [11] Очереди Сокетов (somaxconn & syn_backlog)
+    # [11] Очереди Сокетов
     local somax syn_bl
     somax=$(sysctl -n net.core.somaxconn 2>/dev/null || echo 128)
     syn_bl=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 128)
@@ -746,7 +761,7 @@ EOF
     if [ "$ct_max" -eq 0 ] || [ "$ct_max" -ge 262144 ]; then
         _chk_ok "13. Таблица nf_conntrack" "Активно: ${ct_cnt} / Лимит: ${ct_max:-модуль не загружен}"
     else
-        _chk_warn "13. Таблица nf_conntrack" "Лимит мал: ${ct_cnt}/${ct_max} (риск дропа пакетов)"
+        _chk_warn "13. Таблица nf_conntrack" "Лимит мал: ${ct_cnt}/${ct_max}"
         _mark_finding "NEED_SYSCTL"
     fi
     box_bottom
@@ -765,13 +780,15 @@ EOF
     if [ "$cores" -le 1 ] || [ -n "$rps_val" ]; then
         _chk_ok "14. Балансировка RPS/RFS" "Активна на интерфейсе ${iface:-?}"
     else
-        _chk_warn "14. Балансировка RPS/RFS" "RPS выключен на ${iface:-eth0} (вся сеть на 1 ядре CPU)"
+        _chk_warn "14. Балансировка RPS/RFS" "RPS выключен на ${iface:-eth0} (сеть на 1 ядре)"
         _mark_finding "NEED_RPS"
     fi
 
     # [15] NIC Offloads (GRO / GSO / TSO) и txqueuelen
     local txq="0"
-    [ -n "$iface" ] && [ -r "/sys/class/net/${iface}/tx_queue_len" ] && txq=$(cat "/sys/class/net/${iface}/tx_queue_len" 2>/dev/null || echo 0)
+    if [ -n "$iface" ] && [ -r "/sys/class/net/${iface}/tx_queue_len" ]; then
+        txq=$(cat "/sys/class/net/${iface}/tx_queue_len" 2>/dev/null || echo 0)
+    fi
     if [ "${txq:-0}" -ge 5000 ]; then
         _chk_ok "15. Очередь NIC (txqueuelen)" "${iface}: txqueuelen = ${txq}"
     else
@@ -799,7 +816,7 @@ EOF
     if [ -f "/etc/systemd/journald.conf.d/${ND_DROPIN_PREFIX}.conf" ] || grep -Eq '^[[:space:]]*SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
         _chk_ok "18. Журнал systemd-journald" "Размер логов ограничен"
     else
-        _chk_warn "18. Журнал systemd-journald" "SystemMaxUse не задан (логи могут забить диск)"
+        _chk_warn "18. Журнал systemd-journald" "SystemMaxUse не задан (логи могут занять диск)"
         _mark_finding "NEED_JOURNALD"
     fi
     box_bottom
@@ -819,12 +836,12 @@ EOF
         _chk_fail "19. Служба Docker Engine" "Docker не установлен или не запущен"
     fi
 
-    # [20] Контейнер RemnawaveNode и его ulimits
+    # [20] Контейнер RemnawaveNode
     if [ -f "$REMNANODE_DIR/docker-compose.yml" ] && docker compose --project-directory "$REMNANODE_DIR" ps 2>/dev/null | grep -qE "Up|running"; then
         if ss -tlnp 2>/dev/null | grep -q ":${node_port} "; then
             _chk_ok "20. Контейнер RemnawaveNode" "Запущен, слушает порт ${node_port}/tcp"
         else
-            _chk_warn "20. Контейнер RemnawaveNode" "Контейнер Up, но порт ${node_port}/tcp не слушается"
+            _chk_warn "20. Контейнер RemnawaveNode" "Контейнер Up, но порт ${node_port}/tcp не отвечает"
         fi
     else
         _chk_fail "20. Контейнер RemnawaveNode" "Не установлен или остановлен"
@@ -841,21 +858,19 @@ EOF
     if ss -tln 2>/dev/null | awk '{print $4}' | grep -q "^127\.0\.0\.1:${caddy_port}$"; then
         _chk_ok "22. Изоляция Selfsteal сокета" "Слушает строго на 127.0.0.1:${caddy_port}"
     elif ss -tln 2>/dev/null | grep -q ":${caddy_port} "; then
-        _chk_fail "22. Изоляция Selfsteal сокета" "УТЕЧКА: порт ${caddy_port} слушает на внешнем интерфейсе!"
+        _chk_fail "22. Изоляция Selfsteal сокета" "УТЕЧКА: порт ${caddy_port} слушает публично!"
     else
         _chk_warn "22. Изоляция Selfsteal сокета" "Порт 127.0.0.1:${caddy_port} не прослушивается"
     fi
 
     # [23] Проверка SSL-сертификата Caddy
-    local cert_status="не найден"
     if docker volume inspect caddy_data >/dev/null 2>&1 && [ -n "$caddy_domain" ]; then
         local clean_dom="${caddy_domain#\*.}"
         local cert_end
         cert_end=$(docker run --rm -v caddy_data:/data:ro alpine:latest \
             sh -c 'find /data/caddy/certificates -type f -name "*$1*.crt" | head -1' _ "$clean_dom" 2>/dev/null || true)
         if [ -n "$cert_end" ]; then
-            cert_status="выпущен (${clean_dom})"
-            _chk_ok "23. TLS-сертификат маскировки" "$cert_status"
+            _chk_ok "23. TLS-сертификат маскировки" "Выпущен (${clean_dom})"
         else
             _chk_warn "23. TLS-сертификат маскировки" "Сертификат для ${clean_dom} еще не получен"
         fi
@@ -878,7 +893,7 @@ EOF
         _mark_finding "NEED_UFW_FIX"
     fi
 
-    # [25] Изоляция порта ноды (Strict Panel IP ACL)
+    # [25] Изоляция порта ноды
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
         if ufw status 2>/dev/null | grep -E "^${node_port}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere" >/dev/null 2>&1; then
             _chk_fail "25. ACL порта RemnaNode" "УЯЗВИМОСТЬ: порт ${node_port} открыт всему миру (Anywhere)!"
@@ -894,7 +909,7 @@ EOF
         _mark_finding "NEED_UFW_FIX"
     fi
 
-    # [26] Статус Fail2ban и активных джейлов
+    # [26] Статус Fail2ban
     if command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban && fail2ban-client ping >/dev/null 2>&1; then
         local jails
         jails=$(fail2ban-client status 2>/dev/null | awk -F'Jail list:' '/Jail list:/ {gsub(/^[ \t]+/, "", $2); print $2}')
@@ -904,7 +919,7 @@ EOF
         _mark_finding "NEED_F2B_FIX"
     fi
 
-    # [27] Внешняя связность IPv4 и DNS
+    # [27] Внешняя связность IPv4 и TLS
     if [ "$mode" != "--no-net" ]; then
         if curl -fsSIL --connect-timeout 4 --max-time 6 https://1.1.1.1 >/dev/null 2>&1; then
             _chk_ok "27. Внешняя связность TLS" "HTTPS до 1.1.1.1 работает штатно"
@@ -923,15 +938,15 @@ EOF
     if [ $fail_cnt -eq 0 ] && [ $warn_cnt -eq 0 ]; then
         box_row "${GREEN}${BOLD}Идеальное состояние! Узел полностью оптимизирован и защищен.${NC}"
     else
-        box_row "${SLATE}Для авто-исправления сетевых находок выполните: ${ORANGE}${BOLD}node-mgr optimize --from-findings${NC}"
-        box_row "${SLATE}Для применения полного профиля оптимизации:    ${ORANGE}${BOLD}node-mgr optimize --all${NC}"
+        box_row "${SLATE}Для авто-исправления находок запустите: ${ORANGE}${BOLD}node-mgr optimize --from-findings${NC}"
+        box_row "${SLATE}Для полного профиля оптимизации:       ${ORANGE}${BOLD}node-mgr optimize --all${NC}"
     fi
     box_bottom
     echo
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  МОДУЛЬ 2: ГЛУБОКАЯ ОПТИМИЗАЦИЯ УЗЛА (optimize / rollback / bbr3)
+#  МОДУЛЬ 2: ОПТИМИЗАЦИЯ УЗЛА (optimize / rollback / bbr3)
 # ═══════════════════════════════════════════════════════════════════
 _log_fix() {
     echo "$(date -u +'%Y-%m-%d %H:%M UTC') · $*" >> "$FIX_LOG"
@@ -1086,15 +1101,15 @@ opt_rps() {
     cat > /usr/local/sbin/node-mgr-rps << 'EOF'
 #!/usr/bin/env bash
 cores=$(nproc 2>/dev/null || echo 1)
-[ "$cores" -le 1 ] && exit 0
+if [ "$cores" -le 1 ]; then exit 0; fi
 mask=$(printf '%x' $(( (1 << cores) - 1 )))
 entries=32768
 sysctl -w net.core.rps_sock_flow_entries=$entries >/dev/null 2>&1 || true
 for iface_dir in /sys/class/net/*; do
     iface=$(basename "$iface_dir")
-    [ "$iface" = "lo" ] && continue
+    if [ "$iface" = "lo" ]; then continue; fi
     rx_cnt=$(ls -d "${iface_dir}/queues/rx-"* 2>/dev/null | wc -l)
-    [ "$rx_cnt" -eq 0 ] && continue
+    if [ "$rx_cnt" -eq 0 ]; then continue; fi
     flow_cnt=$(( entries / rx_cnt ))
     for q in "${iface_dir}/queues/rx-"*; do
         echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
@@ -1126,11 +1141,13 @@ EOF
 
 opt_nic() {
     log_info "Тюнинг сетевой карты (GRO/GSO/TSO offloads & txqueuelen 10000)..."
-    command -v ethtool >/dev/null 2>&1 || install_package ethtool >/dev/null 2>&1 || true
+    if ! command -v ethtool >/dev/null 2>&1; then
+        install_package ethtool >/dev/null 2>&1 || true
+    fi
     cat > /usr/local/sbin/node-mgr-nic << 'EOF'
 #!/usr/bin/env bash
 iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-[ -z "$iface" ] && exit 0
+if [ -z "$iface" ]; then exit 0; fi
 ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
 if command -v ethtool >/dev/null 2>&1; then
     ethtool -K "$iface" gro on gso on tso on 2>/dev/null || true
@@ -1162,10 +1179,12 @@ EOF
 opt_mss() {
     log_info "Включение iptables TCPMSS clamp to PMTU..."
     if command -v iptables >/dev/null 2>&1; then
-        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+        if ! iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
             iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-        iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+        fi
+        if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
             iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        fi
         _log_fix "iptables TCPMSS clamp-mss-to-pmtu enabled"
         log_success "Правило TCPMSS clamp-mss-to-pmtu добавлено"
     fi
@@ -1174,7 +1193,9 @@ opt_mss() {
 opt_irqbalance() {
     local cores
     cores=$(nproc 2>/dev/null || echo 1)
-    [ "$cores" -le 1 ] && return 0
+    if [ "$cores" -le 1 ]; then
+        return 0
+    fi
     log_info "Установка и запуск службы irqbalance..."
     if ! command -v irqbalance >/dev/null 2>&1; then
         install_package irqbalance >/dev/null 2>&1 || true
@@ -1208,7 +1229,7 @@ opt_zram() {
     fi
     cat > /usr/local/sbin/node-mgr-zram << 'EOF'
 #!/usr/bin/env bash
-modprobe zram num_devices=1 2>/dev/null || exit 0
+if ! modprobe zram num_devices=1 2>/dev/null; then exit 0; fi
 swapoff /dev/zram0 2>/dev/null || true
 echo 1 > /sys/block/zram0/reset 2>/dev/null || true
 echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || true
@@ -1261,16 +1282,16 @@ run_optimize() {
                 log_info "Файл находок не найден, запускаем предварительную диагностику..."
                 run_diagnose "--no-net"
             fi
-            grep -q "^NEED_SYSCTL=1" "$FINDINGS_FILE"     && opt_sysctl
-            grep -q "^NEED_LIMITS=1" "$FINDINGS_FILE"     && opt_limits
-            grep -q "^NEED_RPS=1" "$FINDINGS_FILE"        && opt_rps
-            grep -q "^NEED_NIC=1" "$FINDINGS_FILE"        && opt_nic
-            grep -q "^NEED_MSS=1" "$FINDINGS_FILE"        && opt_mss
-            grep -q "^NEED_IRQBALANCE=1" "$FINDINGS_FILE" && opt_irqbalance
-            grep -q "^NEED_JOURNALD=1" "$FINDINGS_FILE"   && opt_journald
-            grep -q "^NEED_ZRAM=1" "$FINDINGS_FILE"       && opt_zram
-            grep -q "^NEED_UFW_FIX=1" "$FINDINGS_FILE"    && setup_ufw
-            grep -q "^NEED_F2B_FIX=1" "$FINDINGS_FILE"    && install_fail2ban
+            if grep -q "^NEED_SYSCTL=1" "$FINDINGS_FILE" 2>/dev/null; then opt_sysctl; fi
+            if grep -q "^NEED_LIMITS=1" "$FINDINGS_FILE" 2>/dev/null; then opt_limits; fi
+            if grep -q "^NEED_RPS=1" "$FINDINGS_FILE" 2>/dev/null; then opt_rps; fi
+            if grep -q "^NEED_NIC=1" "$FINDINGS_FILE" 2>/dev/null; then opt_nic; fi
+            if grep -q "^NEED_MSS=1" "$FINDINGS_FILE" 2>/dev/null; then opt_mss; fi
+            if grep -q "^NEED_IRQBALANCE=1" "$FINDINGS_FILE" 2>/dev/null; then opt_irqbalance; fi
+            if grep -q "^NEED_JOURNALD=1" "$FINDINGS_FILE" 2>/dev/null; then opt_journald; fi
+            if grep -q "^NEED_ZRAM=1" "$FINDINGS_FILE" 2>/dev/null; then opt_zram; fi
+            if grep -q "^NEED_UFW_FIX=1" "$FINDINGS_FILE" 2>/dev/null; then setup_ufw; fi
+            if grep -q "^NEED_F2B_FIX=1" "$FINDINGS_FILE" 2>/dev/null; then install_fail2ban; fi
             ;;
         --zram)       opt_zram ;;
         --sysctl)     opt_sysctl ;;
@@ -1341,11 +1362,11 @@ run_bbr3_xanmod() {
     fi
     log_info "Текущее ядро: $(uname -r) | Выбран профиль CPU: ${ORANGE}${xanmod_level}${NC}"
 
-    if ! prompt_yn "Установить пакет linux-xanmod-${xanmod_level} (потребуется ручная перезагрузка)? (y/n): " "y"; then
+    if ! prompt_yn "Установить пакет linux-xanmod-${xanmod_level} (потребуется перезагрузка)? (y/n): " "y"; then
         return 0
     fi
 
-    command -v gpg >/dev/null 2>&1 || install_package gnupg
+    if ! command -v gpg >/dev/null 2>&1; then install_package gnupg; fi
     local xanmod_key="/usr/share/keyrings/xanmod-archive-keyring.gpg"
     curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o "$xanmod_key"
     echo "deb [signed-by=$xanmod_key] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
@@ -1355,7 +1376,7 @@ run_bbr3_xanmod() {
     if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "linux-xanmod-${xanmod_level}"; then
         _log_fix "XanMod kernel (${xanmod_level}) installed"
         log_success "Ядро XanMod (${xanmod_level}) успешно установлено!"
-        log_warning "Выполните 'reboot' в удобное время для загрузки с новым ядром и BBRv3."
+        log_warning "Выполните 'reboot' в удобное время для загрузки с ядром BBRv3."
     else
         log_error "Не удалось установить пакет ядра XanMod"
         return 1
@@ -1371,27 +1392,29 @@ install_docker() {
         return 0
     fi
 
-    [[ "$PKG_MANAGER" == "apt-get" ]] && wait_for_dpkg_lock
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then wait_for_dpkg_lock; fi
 
     log_info "Установка официального Docker Engine и Docker Compose v2..."
     local docker_install_log docker_script
     docker_install_log=$(create_temp_file)
     docker_script=$(create_temp_file)
 
-    curl -fsSL https://get.docker.com -o "$docker_script" 2>/dev/null || return 1
+    if ! curl -fsSL https://get.docker.com -o "$docker_script" 2>/dev/null; then
+        return 1
+    fi
     sh "$docker_script" >"$docker_install_log" 2>&1 &
     spinner $! "Установка Docker Engine..."
 
     systemctl enable --now docker >/dev/null 2>&1 || true
     sleep 2
-    docker ps >/dev/null 2>&1 && return 0
+    if docker ps >/dev/null 2>&1; then return 0; fi
     return 1
 }
 
 check_docker_compose() {
     local retries=0
     while [ $retries -lt 5 ]; do
-        docker compose version >/dev/null 2>&1 && return 0
+        if docker compose version >/dev/null 2>&1; then return 0; fi
         sleep 2
         retries=$((retries + 1))
     done
@@ -1399,11 +1422,16 @@ check_docker_compose() {
 }
 
 check_existing_remnanode() {
-    [ -d "$REMNANODE_DIR" ] && [ -f "$REMNANODE_DIR/docker-compose.yml" ]
+    if [ -d "$REMNANODE_DIR" ] && [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        return 0
+    fi
+    return 1
 }
 
 setup_logrotate() {
-    command -v logrotate >/dev/null 2>&1 || install_package logrotate 2>/dev/null || true
+    if ! command -v logrotate >/dev/null 2>&1; then
+        install_package logrotate 2>/dev/null || true
+    fi
     if command -v logrotate >/dev/null 2>&1; then
         cat > /etc/logrotate.d/remnanode << 'EOF'
 /var/log/remnanode/*.log {
@@ -1422,16 +1450,20 @@ install_xray_core() {
     log_info "Скачивание свежего релиза Xray-core с GitHub..."
     local ARCH
     ARCH=$(detect_arch xray) || return 1
-    command -v unzip >/dev/null 2>&1 || install_package unzip || return 1
+    if ! command -v unzip >/dev/null 2>&1; then
+        install_package unzip || return 1
+    fi
 
     local api_response latest_release
     api_response=$(curl -s --connect-timeout 10 --max-time 25 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null) || true
     latest_release=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-    [ -z "$latest_release" ] && return 1
+    if [ -z "$latest_release" ]; then return 1; fi
 
     local xray_filename="Xray-linux-$ARCH.zip"
     mkdir -p "$REMNANODE_DATA_DIR"
-    download_with_progress "https://github.com/XTLS/Xray-core/releases/download/${latest_release}/${xray_filename}" "${REMNANODE_DATA_DIR}/${xray_filename}" "Загрузка Xray-core ${latest_release}..." || return 1
+    if ! download_with_progress "https://github.com/XTLS/Xray-core/releases/download/${latest_release}/${xray_filename}" "${REMNANODE_DATA_DIR}/${xray_filename}" "Загрузка Xray-core ${latest_release}..."; then
+        return 1
+    fi
 
     unzip -o "${REMNANODE_DATA_DIR}/${xray_filename}" -d "$REMNANODE_DATA_DIR" >/dev/null 2>&1
     rm -f "${REMNANODE_DATA_DIR}/${xray_filename}"
@@ -1465,7 +1497,7 @@ install_remnanode() {
     else
         echo -e "  ${ORANGE}🔑 Вставьте SECRET_KEY из панели Remnawave (нажмите ENTER на пустой строке для завершения):${NC}"
         while IFS= read -r line; do
-            [ -z "$line" ] && break
+            if [ -z "$line" ]; then break; fi
             SECRET_KEY_VALUE="${SECRET_KEY_VALUE}${line}"
         done
     fi
@@ -1540,8 +1572,12 @@ EOF
 
     if [ "$has_host_xray" = true ] && [ -f "$REMNANODE_DATA_DIR/xray" ]; then
         echo "      - $REMNANODE_DATA_DIR/xray:/usr/local/bin/xray" >> "$REMNANODE_DIR/docker-compose.yml"
-        [ -f "$REMNANODE_DATA_DIR/geoip.dat" ]   && echo "      - $REMNANODE_DATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat" >> "$REMNANODE_DIR/docker-compose.yml"
-        [ -f "$REMNANODE_DATA_DIR/geosite.dat" ] && echo "      - $REMNANODE_DATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat" >> "$REMNANODE_DIR/docker-compose.yml"
+        if [ -f "$REMNANODE_DATA_DIR/geoip.dat" ]; then
+            echo "      - $REMNANODE_DATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat" >> "$REMNANODE_DIR/docker-compose.yml"
+        fi
+        if [ -f "$REMNANODE_DATA_DIR/geosite.dat" ]; then
+            echo "      - $REMNANODE_DATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat" >> "$REMNANODE_DIR/docker-compose.yml"
+        fi
     fi
 
     setup_logrotate
@@ -1576,7 +1612,10 @@ TEMPLATES=(
 )
 
 check_existing_caddy() {
-    [ -d "$CADDY_DIR" ] && [ -f "$CADDY_DIR/docker-compose.yml" ]
+    if [ -d "$CADDY_DIR" ] && [ -f "$CADDY_DIR/docker-compose.yml" ]; then
+        return 0
+    fi
+    return 1
 }
 
 inject_antifingerprint_hash() {
@@ -1628,7 +1667,9 @@ select_and_download_template() {
     echo
 
     local tmpl_choice="$i"
-    [ "${NON_INTERACTIVE:-false}" != true ] && prompt_choice "Номер шаблона [1-$i]: " "$i" tmpl_choice "$i"
+    if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        prompt_choice "Номер шаблона [1-$i]: " "$i" tmpl_choice "$i"
+    fi
 
     local entry
     if [ "$tmpl_choice" -eq "$i" ]; then
@@ -1643,7 +1684,11 @@ validate_cloudflare_token() {
     local token="$1"
     local resp
     resp=$(curl -s --connect-timeout 8 --max-time 12 -H "Authorization: Bearer $token" "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || true
-    echo "$resp" | grep -q '"success":true'
+    if echo "$resp" | grep -q '"success":true'; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 install_caddy_selfsteal() {
@@ -1663,7 +1708,6 @@ install_caddy_selfsteal() {
         docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
     fi
 
-    # Гарантируем создание лог-файлов ДО запуска Caddy и Fail2ban
     mkdir -p "$CADDY_DIR" "$CADDY_HTML_DIR" "$CADDY_DIR/logs"
     touch "$CADDY_DIR/logs/access.log" "$CADDY_DIR/logs/default.log"
     chmod 644 "$CADDY_DIR/logs/access.log" "$CADDY_DIR/logs/default.log"
@@ -1725,7 +1769,9 @@ install_caddy_selfsteal() {
 SELF_STEAL_DOMAIN=$domain
 SELF_STEAL_PORT=$port
 EOF
-    [ "$USE_WILDCARD" = true ] && printf 'CLOUDFLARE_API_TOKEN=%s\n' "$CLOUDFLARE_API_TOKEN" >> "$CADDY_DIR/.env"
+    if [ "$USE_WILDCARD" = true ]; then
+        printf 'CLOUDFLARE_API_TOKEN=%s\n' "$CLOUDFLARE_API_TOKEN" >> "$CADDY_DIR/.env"
+    fi
     chmod 600 "$CADDY_DIR/.env"
     umask 022
 
@@ -1838,7 +1884,6 @@ EOF
     echo
     select_and_download_template || true
 
-    # Принудительное удаление старого контейнера во избежание конфликта имен Docker
     docker rm -f caddy-selfsteal 2>/dev/null || true
     docker compose --project-directory "$CADDY_DIR" pull --quiet 2>/dev/null || true
     docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
@@ -1873,7 +1918,9 @@ setup_ufw() {
         return 0
     fi
 
-    command -v ufw >/dev/null 2>&1 || install_package ufw || { STATUS_UFW="ошибка"; return 1; }
+    if ! command -v ufw >/dev/null 2>&1; then
+        install_package ufw || { STATUS_UFW="ошибка"; return 1; }
+    fi
 
     local ssh_port node_port caddy_port panel_ip
     ssh_port=$(detect_ssh_port)
@@ -1889,7 +1936,9 @@ setup_ufw() {
         fi
         read -p "  ${ORANGE}▸${NC} Введите IP-адрес панели Remnawave (для доступа к порту ${node_port}): " -r panel_ip
         panel_ip=$(echo "$panel_ip" | tr -d '[:space:]')
-        ! validate_ip_or_cidr "$panel_ip" && panel_ip=""
+        if ! validate_ip_or_cidr "$panel_ip"; then
+            panel_ip=""
+        fi
     done
     DETAIL_PANEL_IP="$panel_ip"
 
@@ -1906,9 +1955,10 @@ setup_ufw() {
     ufw allow in on lo >/dev/null 2>&1 || true
 
     ufw allow "${ssh_port}/tcp" comment 'SSH Active' >/dev/null 2>&1 || true
-    [ "$ssh_port" != "22" ] && ufw allow 22/tcp comment 'SSH Default' >/dev/null 2>&1 || true
+    if [ "$ssh_port" != "22" ]; then
+        ufw allow 22/tcp comment 'SSH Default' >/dev/null 2>&1 || true
+    fi
 
-    # Удаляем любые публичные правила на порт ноды и открываем СТРОГО для IP панели
     ufw delete allow "${node_port}/tcp" >/dev/null 2>&1 || true
     ufw delete allow "${node_port}" >/dev/null 2>&1 || true
     ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment 'RemnaNode API (Panel Only)' >/dev/null 2>&1
@@ -1935,21 +1985,23 @@ install_fail2ban() {
         return 0
     fi
 
-    command -v fail2ban-client >/dev/null 2>&1 || install_package fail2ban || { STATUS_FAIL2BAN="ошибка"; return 1; }
-    [[ "$PKG_MANAGER" == "apt-get" ]] && install_package python3-systemd >/dev/null 2>&1 || true
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        install_package fail2ban || { STATUS_FAIL2BAN="ошибка"; return 1; }
+    fi
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+        install_package python3-systemd >/dev/null 2>&1 || true
+    fi
 
-    # 1. Полная зачистка старых конфликтующих конфигов и зависших процессов
+    # Полная зачистка старых конфликтующих файлов
     systemctl stop fail2ban 2>/dev/null || true
     pkill -9 -f fail2ban-server 2>/dev/null || true
     rm -f /var/run/fail2ban/fail2ban.sock /run/fail2ban/fail2ban.sock /var/run/fail2ban/fail2ban.pid 2>/dev/null || true
     rm -f /etc/fail2ban/jail.d/node-mgr.local /etc/fail2ban/jail.d/defaults-debian.conf /etc/fail2ban/jail.d/customisation.local 2>/dev/null || true
 
-    # 2. Гарантируем наличие лог-файла Caddy до старта Fail2ban
     mkdir -p "$CADDY_DIR/logs" /var/log/remnanode /etc/fail2ban/filter.d /etc/fail2ban/action.d
     touch "$CADDY_DIR/logs/access.log"
     chmod 644 "$CADDY_DIR/logs/access.log"
 
-    # 3. Гарантируем наличие корректного /etc/fail2ban/action.d/ufw.conf
     if [ ! -f /etc/fail2ban/action.d/ufw.conf ]; then
         cat > /etc/fail2ban/action.d/ufw.conf << 'EOF'
 [Definition]
@@ -1961,7 +2013,6 @@ actionunban = [ -n "<ip>" ] && ufw delete deny from <ip> to any
 EOF
     fi
 
-    # 4. Фильтр для JSON-логов Caddy
     cat > /etc/fail2ban/filter.d/caddy-status.conf << 'EOF'
 [Definition]
 failregex = ^.*"remote_ip":"<HOST>".*"status":(400|401|403|404|405|444)\b.*$
@@ -1971,7 +2022,6 @@ failregex = ^.*"remote_ip":"<HOST>".*"status":(400|401|403|404|405|444)\b.*$
 ignoreregex =
 EOF
 
-    # 5. Определение бэкенда для sshd
     local ssh_port ssh_backend ssh_logpath_line=""
     ssh_port=$(detect_ssh_port)
     if python3 -c "import systemd.journal" >/dev/null 2>&1; then
@@ -2111,15 +2161,20 @@ show_status() {
              "/etc/security/limits.d/${ND_DROPIN_PREFIX}-limits.conf" \
              "/etc/modules-load.d/${ND_DROPIN_PREFIX}.conf" \
              "/etc/systemd/journald.conf.d/${ND_DROPIN_PREFIX}.conf"; do
-        [ -e "$f" ] && { box_row "${GREEN}✔${NC} ${f}"; found=1; }
+        if [ -e "$f" ]; then box_row "${GREEN}✔${NC} ${f}"; found=1; fi
     done
     for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram; do
-        [ -e "/etc/systemd/system/${svc}.service" ] && { box_row "${GREEN}✔${NC} ${svc}.service"; found=1; }
+        if [ -e "/etc/systemd/system/${svc}.service" ]; then box_row "${GREEN}✔${NC} ${svc}.service"; found=1; fi
     done
-    if command -v iptables >/dev/null 2>&1 && iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-        box_row "${GREEN}✔${NC} iptables TCPMSS clamp (mangle OUTPUT)"; found=1
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            box_row "${GREEN}✔${NC} iptables TCPMSS clamp (mangle OUTPUT)"
+            found=1
+        fi
     fi
-    [ "$found" -eq 0 ] && box_row "${DIM}Оптимизации еще не наложены (запустите: node-mgr optimize --all)${NC}"
+    if [ "$found" -eq 0 ]; then
+        box_row "${DIM}Оптимизации еще не наложены (запустите: node-mgr optimize --all)${NC}"
+    fi
     box_bottom
     echo
 }
@@ -2141,7 +2196,9 @@ run_full_install() {
     _init_env
     print_header "ПОЛНАЯ УСТАНОВКА И ОПТИМИЗАЦИЯ УЗЛА [1/6 .. 6/6]"
 
-    check_disk_space 500 "/opt" || { prompt_yn "Продолжить? (y/n): " "n" || exit 1; }
+    if ! check_disk_space 500 "/opt"; then
+        if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
+    fi
     ensure_package_manager_available
     _RESTORE_AUTO_UPDATES=true
     install_base_utilities
@@ -2196,7 +2253,7 @@ run_selective_install() {
     for c in $selection_raw; do
         case "$c" in
             1) run_optimize "--all" ;;
-            2) install_docker && check_docker_compose && STATUS_DOCKER="установлен" ;;
+            2) if install_docker && check_docker_compose; then STATUS_DOCKER="установлен"; fi ;;
             3) install_remnanode ;;
             4) install_caddy_selfsteal ;;
             5) setup_ufw ;;
@@ -2232,7 +2289,9 @@ export_config() {
     print_header "ЭКСПОРТ КОНФИГУРАЦИИ ДЛЯ КЛОНИРОВАНИЯ"
 
     local cfg_secret=""
-    [ -f "$REMNANODE_DIR/.env" ] && cfg_secret=$(grep "^SECRET_KEY=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
+    if [ -f "$REMNANODE_DIR/.env" ]; then
+        cfg_secret=$(grep "^SECRET_KEY=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
+    fi
 
     umask 077
     cat > "$output" << EOF
@@ -2255,10 +2314,17 @@ uninstall_all() {
     _init_env
     print_header "ПОЛНОЕ УДАЛЕНИЕ КОМПОНЕНТОВ УЗЛА"
     read -p "  ${ORANGE}▸${NC} Введите 'YES' для подтверждения удаления: " -r confirm
-    [ "$confirm" != "YES" ] && { log_info "Отменено."; return 0; }
+    if [ "$confirm" != "YES" ]; then
+        log_info "Отменено."
+        return 0
+    fi
 
-    [ -f "$REMNANODE_DIR/docker-compose.yml" ] && docker compose --project-directory "$REMNANODE_DIR" down 2>/dev/null || true
-    [ -f "$CADDY_DIR/docker-compose.yml" ] && docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
+    if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        docker compose --project-directory "$REMNANODE_DIR" down 2>/dev/null || true
+    fi
+    if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
+        docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
+    fi
     docker rm -f remnanode caddy-selfsteal 2>/dev/null || true
 
     run_rollback
@@ -2295,7 +2361,7 @@ HELP
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  Интерактивное меню (стиль node-diagnostic)
+#  Интерактивное меню
 # ═══════════════════════════════════════════════════════════════════
 show_main_menu() {
     while true; do
@@ -2345,8 +2411,8 @@ show_main_menu() {
                 printf "  ${ORANGE}▸${NC} Выбор [1-2]: "
                 local rc=""
                 read -r rc
-                [ "$rc" = "1" ] && run_rollback
-                [ "$rc" = "2" ] && uninstall_all
+                if [ "$rc" = "1" ]; then run_rollback; fi
+                if [ "$rc" = "2" ]; then uninstall_all; fi
                 ;;
             0|q|"")
                 log_info "Выход."
@@ -2385,7 +2451,7 @@ main() {
 }
 
 cmd="${1:-}"
-[ $# -gt 0 ] && shift || true
+if [ $# -gt 0 ]; then shift; fi
 
 case "$cmd" in
     diagnose|diag|--diagnose)         run_diagnose "${1:-full}" ;;
