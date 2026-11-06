@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v3.4.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.0.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
-#  Remnawave API Auto-Deploy • Caddy Selfsteal • UFW (Strict ACL) • Fail2ban
-#  Integrated 27-Point Node Diagnostic & Kernel/NIC/RPS/MSS/Zram Optimizer
+#  Remnawave API Auto-Deploy • Caddy L4 (Vision + XHTTP) • E2E Handshake Probe
+#  Kernel Highload + CAKE Shaper • UFW/nftables/Fail2ban • NetBird & Monitoring
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -30,6 +30,7 @@ readonly WHITE=$'\033[38;2;251;251;251m'
 readonly GREEN=$'\033[38;2;46;204;113m'
 readonly YELLOW=$'\033[38;2;241;196;15m'
 readonly RED=$'\033[38;2;231;76;60m'
+readonly CYAN=$'\033[38;2;52;152;219m'
 readonly NC=$'\033[0m'
 readonly BOLD=$'\033[1m'
 readonly DIM=$'\033[2m'
@@ -37,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="3.4.0"
+readonly SCRIPT_VERSION="4.0.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -46,14 +47,16 @@ readonly ND_STATE_DIR="/var/lib/node-mgr"
 readonly FINDINGS_FILE="${ND_STATE_DIR}/findings.env"
 readonly FIX_LOG="${ND_STATE_DIR}/applied-fixes.log"
 readonly API_STATE_FILE="${ND_STATE_DIR}/remnawave-api.env"
+readonly PROTECT_OUT_DIR="${ND_STATE_DIR}/protect"
 readonly ND_DROPIN_PREFIX="99-lissvpn"
-readonly ND_BOX_W=68
+readonly ND_BOX_W=70
 
 readonly INSTALL_DIR="/opt"
 readonly REMNANODE_DIR="${INSTALL_DIR}/remnanode"
 readonly REMNANODE_DATA_DIR="/var/lib/remnanode"
 readonly CADDY_DIR="${INSTALL_DIR}/selfsteel"
 readonly CADDY_HTML_DIR="${INSTALL_DIR}/html"
+readonly MONITORING_DIR="${INSTALL_DIR}/monitoring"
 readonly CADDY_CONTAINER_NAME="caddy-remnawave"
 readonly CADDY_DATA_VOL="selfsteel_caddy_data_selfsteal"
 readonly CADDY_CONFIG_VOL="selfsteel_caddy_config_selfsteal"
@@ -61,6 +64,10 @@ readonly DEFAULT_PORT="9443"
 readonly DEFAULT_VISION_PORT="10443"
 readonly DEFAULT_XHTTP_PORT="10444"
 readonly DEFAULT_XHTTP_PATH="/api/v3/sync/r1"
+
+CADVISOR_VERSION="0.53.0"
+NODE_EXPORTER_VERSION="1.9.1"
+VMAGENT_VERSION="1.123.0"
 
 mkdir -p "$(dirname "$INSTALL_LOG")" "$ND_STATE_DIR" 2>/dev/null || true
 if [ -f "$INSTALL_LOG" ] && [ "$(stat -c%s "$INSTALL_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
@@ -108,10 +115,17 @@ CFG_NODE_PORT="${CFG_NODE_PORT:-3000}"
 CFG_PANEL_IP="${CFG_PANEL_IP:-}"
 CFG_INSTALL_XRAY="${CFG_INSTALL_XRAY:-y}"
 CFG_DOMAIN="${CFG_DOMAIN:-}"
+CFG_CERT_TYPE="${CFG_CERT_TYPE:-1}"
+CFG_CLOUDFLARE_TOKEN="${CFG_CLOUDFLARE_TOKEN:-}"
 CFG_CADDY_PORT="${CFG_CADDY_PORT:-$DEFAULT_PORT}"
 CFG_APPLY_NETWORK="${CFG_APPLY_NETWORK:-y}"
 CFG_SETUP_UFW="${CFG_SETUP_UFW:-y}"
 CFG_INSTALL_FAIL2BAN="${CFG_INSTALL_FAIL2BAN:-y}"
+CFG_INSTALL_NETBIRD="${CFG_INSTALL_NETBIRD:-n}"
+CFG_NETBIRD_SETUP_KEY="${CFG_NETBIRD_SETUP_KEY:-}"
+CFG_INSTALL_MONITORING="${CFG_INSTALL_MONITORING:-n}"
+CFG_INSTANCE_NAME="${CFG_INSTANCE_NAME:-}"
+CFG_GRAFANA_IP="${CFG_GRAFANA_IP:-}"
 
 STATUS_NETWORK="пропущен"
 STATUS_DOCKER="пропущен"
@@ -120,6 +134,8 @@ STATUS_API="пропущен"
 STATUS_REMNANODE="пропущен"
 STATUS_UFW="пропущен"
 STATUS_FAIL2BAN="пропущен"
+STATUS_NETBIRD="пропущен"
+STATUS_MONITORING="пропущен"
 
 DETAIL_REMNANODE_PORT=""
 DETAIL_PANEL_IP=""
@@ -130,6 +146,8 @@ DETAIL_NODE_UUID=""
 DETAIL_PROFILE_UUID=""
 DETAIL_HOST_UUID=""
 DETAIL_XHTTP_HOST_UUID=""
+DETAIL_NETBIRD_IP=""
+DETAIL_GRAFANA_IP=""
 NODE_IP=""
 OS=""
 PKG_MANAGER=""
@@ -157,7 +175,7 @@ ui_rule() {
 box_top() {
     local title="$1"
     local tlen=${#title}
-    local pad=$(( ND_BOX_W - tlen - 5 ))
+    local pad=$(( ND_BOX_W - tlen - 4 ))
     if [ $pad -lt 2 ]; then pad=2; fi
     printf "  %s┌─ %s%s%s " "${GRAPHITE}" "${ORANGE}${BOLD}" "$title" "${NC}${GRAPHITE}"
     for ((i=1; i<=pad; i++)); do printf "─"; done
@@ -171,7 +189,7 @@ box_row() {
 box_kv() {
     local key="$1"
     local val="$2"
-    printf "  %s│%s  ${SLATE}%-22s${NC} %b\n" "${GRAPHITE}" "${NC}" "${key}:" "${WHITE}${val}${NC}"
+    printf "  %s│%s  ${SLATE}%-24s${NC} %b\n" "${GRAPHITE}" "${NC}" "${key}:" "${WHITE}${val}${NC}"
 }
 
 box_bottom() {
@@ -198,10 +216,46 @@ detect_virt() {
 }
 
 print_banner() {
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
     echo
-    echo -e "  ${ORANGE}${BOLD}LISSVPN NODE ORCHESTRATOR${NC}  ${GRAPHITE}v${SCRIPT_VERSION} · node-mgr toolkit${NC}"
+    echo -e "  ${ORANGE}${BOLD}🦊 LISSVPN NODE ORCHESTRATOR${NC}  ${GRAPHITE}v${SCRIPT_VERSION} · L4 Multi-Protocol Toolkit${NC}"
+    ui_rule "━"
+    echo -e "  ${GRAPHITE}$(date -u +'%Y-%m-%d %H:%M UTC') · ${WHITE}$(hostname)${GRAPHITE} · $(detect_virt) · TCP: ${ORANGE}${cc}+${qdisc}${GRAPHITE} · IP: ${WHITE}${NODE_IP:-...}${NC}"
+}
+
+print_live_statusbar() {
+    local rn_pill cd_pill ufw_pill f2b_pill nb_pill
+    if is_container_running "remnanode"; then
+        rn_pill="${GREEN}${BOLD}●${NC} ${WHITE}RemnaNode${NC}"
+    else
+        rn_pill="${GRAPHITE}○ RemnaNode${NC}"
+    fi
+    if is_caddy_running; then
+        cd_pill="${GREEN}${BOLD}●${NC} ${WHITE}Caddy L4${NC}"
+    else
+        cd_pill="${GRAPHITE}○ Caddy L4${NC}"
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        ufw_pill="${GREEN}${BOLD}●${NC} ${WHITE}UFW${NC}"
+    else
+        ufw_pill="${YELLOW}○ UFW${NC}"
+    fi
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        f2b_pill="${GREEN}${BOLD}●${NC} ${WHITE}Fail2ban${NC}"
+    else
+        f2b_pill="${YELLOW}○ Fail2ban${NC}"
+    fi
+    local nb_ip=""
+    nb_ip=$(ip -4 addr show wt0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+    if [ -n "$nb_ip" ]; then
+        nb_pill="${GREEN}${BOLD}●${NC} ${WHITE}NetBird (${nb_ip})${NC}"
+    else
+        nb_pill="${GRAPHITE}○ NetBird${NC}"
+    fi
+    echo -e "  ${rn_pill}   ${cd_pill}   ${ufw_pill}   ${f2b_pill}   ${nb_pill}"
     ui_rule "─"
-    echo -e "  ${GRAPHITE}$(date -u +'%Y-%m-%d %H:%M UTC') · $(hostname) · $(detect_virt) · IP: ${WHITE}${NODE_IP:-...}${NC}"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -664,8 +718,17 @@ backup_existing_config() {
 load_config_file() {
     local config_file="${1:-$CONFIG_FILE}"
     if [ -f "$config_file" ]; then
+        local file_owner file_perms
+        file_owner=$(stat -c '%U' "$config_file" 2>/dev/null || echo "root")
+        file_perms=$(stat -c '%a' "$config_file" 2>/dev/null || echo "600")
+        if [ "$file_owner" != "root" ]; then
+            log_warning "Конфиг-файл $config_file принадлежит $file_owner (рекомендуется root)"
+        fi
+        if [[ "$file_perms" =~ [0-7][2367][0-7] ]]; then
+            log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
+        fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -680,13 +743,157 @@ load_config_file() {
     fi
 }
 
+validate_cloudflare_token() {
+    local token="$1"
+    log_info "Проверка Cloudflare API Token через Cloudflare API..."
+    local response
+    response=$(curl -s --connect-timeout 8 --max-time 12 \
+        -H "Authorization: Bearer $token" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || true
+    if echo "$response" | grep -q '"success":true'; then
+        log_success "Cloudflare API Token валиден"
+        return 0
+    else
+        local error_msg
+        error_msg=$(echo "$response" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1)
+        log_error "Cloudflare API Token невалиден${error_msg:+: $error_msg}"
+        return 1
+    fi
+}
+
+validate_domain_dns() {
+    local domain="${1#\*.}"
+    local server_ip="${2:-$NODE_IP}"
+    log_info "Проверка DNS A-записи для ${domain}..."
+    local dns_ip=""
+    if command -v dig >/dev/null 2>&1; then
+        dns_ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1 || true)
+    fi
+    if [ -z "$dns_ip" ]; then
+        dns_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}' || true)
+    fi
+    if [ -z "$dns_ip" ]; then
+        log_warning "Не удалось получить IPv4 для домена ${domain}"
+        return 1
+    fi
+    if [ "$dns_ip" != "$server_ip" ]; then
+        log_warning "DNS не совпадает: ${domain} -> ${dns_ip}, а IP этого сервера: ${server_ip}"
+        return 1
+    fi
+    log_success "DNS настроен корректно: ${domain} -> ${dns_ip}"
+    return 0
+}
+
+fetch_latest_version() {
+    local repo="$1"
+    local default="$2"
+    local version="" api_response=""
+    api_response=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null) || true
+    if [ -n "$api_response" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            version=$(echo "$api_response" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+        else
+            version=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/^v//')
+        fi
+    fi
+    echo "${version:-$default}"
+}
+
+fetch_latest_vmagent_version() {
+    local default="$1"
+    local version="" api_response=""
+    api_response=$(curl -s --connect-timeout 5 --max-time 15 \
+        "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases?per_page=15" 2>/dev/null) || true
+    if [ -n "$api_response" ] && command -v jq >/dev/null 2>&1; then
+        version=$(echo "$api_response" | jq -r '
+            [.[] | select(.assets[]?.name | test("^vmutils-linux-.*\\.tar\\.gz$") and (test("enterprise") | not))][0].tag_name // empty
+        ' 2>/dev/null | sed 's/^v//')
+    fi
+    echo "${version:-$default}"
+}
+
+update_component_versions() {
+    local new_ver
+    new_ver=$(fetch_latest_version "google/cadvisor" "$CADVISOR_VERSION")
+    [ -n "$new_ver" ] && CADVISOR_VERSION="$new_ver"
+    new_ver=$(fetch_latest_version "prometheus/node_exporter" "$NODE_EXPORTER_VERSION")
+    [ -n "$new_ver" ] && NODE_EXPORTER_VERSION="$new_ver"
+    new_ver=$(fetch_latest_vmagent_version "$VMAGENT_VERSION")
+    [ -n "$new_ver" ] && VMAGENT_VERSION="$new_ver"
+}
+
+validate_ip() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}" o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+        if [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+validate_setup_key() {
+    local key="$1"
+    if [[ "$key" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || [[ "${#key}" -ge 16 ]]; then
+        return 0
+    fi
+    log_warning "Неверный формат Setup Key (ожидается UUID вида XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)"
+    return 1
+}
+
+validate_instance_name() {
+    local name="$1"
+    if [[ "$name" =~ ^[a-zA-Z0-9_.-]{1,64}$ ]]; then
+        return 0
+    fi
+    log_warning "Имя инстанса должно содержать только буквы, цифры, дефис, точку или подчеркивание (1..64 симв.)"
+    return 1
+}
+
+check_existing_netbird() {
+    if ! command -v netbird >/dev/null 2>&1; then
+        return 1
+    fi
+    local nb_ip=""
+    nb_ip=$(ip -4 addr show wt0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+    if [ -n "$nb_ip" ]; then
+        DETAIL_NETBIRD_IP="$nb_ip"
+        return 0
+    fi
+    if netbird status 2>/dev/null | grep -qi "Connected"; then
+        return 0
+    fi
+    return 2
+}
+
+check_existing_monitoring() {
+    if [ -d "$MONITORING_DIR" ] && [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
+        local g_ip=""
+        g_ip=$(grep -oE 'remoteWrite\.url=http://[0-9.]+' "$MONITORING_DIR/docker-compose.yml" 2>/dev/null | sed 's|.*http://||' | head -1 || true)
+        [ -n "$g_ip" ] && DETAIL_GRAFANA_IP="$g_ip"
+        if is_container_running "vmagent" || is_container_running "node-exporter"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════
-#  МОДУЛЬ 1: ДИАГНОСТИКА НОДЫ (27 чеков, дашборд, findings, вердикт)
+#  МОДУЛЬ 1: ДИАГНОСТИКА НОДЫ (33 чека, дашборд, findings, JSON, вердикт)
 # ═══════════════════════════════════════════════════════════════════
 run_diagnose() {
     _init_env
     local mode="${1:-full}"
+    local emit_json_mode=false
+    if [ "$mode" = "--json" ]; then
+        emit_json_mode=true
+        exec 3>&1 1>>"$INSTALL_LOG" 2>&1
+    fi
     local pass_cnt=0 warn_cnt=0 fail_cnt=0
+    local summary_txt="/tmp/node-diagnostic-summary-$(date +%Y%m%d-%H%M%S).txt"
+    : > "$summary_txt" 2>/dev/null || true
 
     cat > "$FINDINGS_FILE" << EOF
 # Generated by node-mgr diagnose on $(date -u +'%Y-%m-%dT%H:%M:%SZ')
@@ -707,15 +914,15 @@ EOF
         sed -i "s/^${key}=0/${key}=1/" "$FINDINGS_FILE" 2>/dev/null || true
     }
 
-    _chk_ok()   { pass_cnt=$((pass_cnt + 1)); box_row "${GREEN}${BOLD}[ PASS ]${NC} $(printf '%-26s' "$1") ${SLATE}$2${NC}"; }
-    _chk_warn() { warn_cnt=$((warn_cnt + 1)); box_row "${YELLOW}${BOLD}[ WARN ]${NC} $(printf '%-26s' "$1") ${YELLOW}$2${NC}"; }
-    _chk_fail() { fail_cnt=$((fail_cnt + 1)); box_row "${RED}${BOLD}[ FAIL ]${NC} $(printf '%-26s' "$1") ${RED}$2${NC}"; }
+    _chk_ok()   { pass_cnt=$((pass_cnt + 1)); echo "[PASS] $1: $2" >> "$summary_txt" 2>/dev/null || true; box_row "${GREEN}${BOLD}[ PASS ]${NC} $(printf '%-26s' "$1") ${SLATE}$2${NC}"; }
+    _chk_warn() { warn_cnt=$((warn_cnt + 1)); echo "[WARN] $1: $2" >> "$summary_txt" 2>/dev/null || true; box_row "${YELLOW}${BOLD}[ WARN ]${NC} $(printf '%-26s' "$1") ${YELLOW}$2${NC}"; }
+    _chk_fail() { fail_cnt=$((fail_cnt + 1)); echo "[FAIL] $1: $2" >> "$summary_txt" 2>/dev/null || true; box_row "${RED}${BOLD}[ FAIL ]${NC} $(printf '%-26s' "$1") ${RED}$2${NC}"; }
 
     print_banner
     echo
 
     # ── Блок 1: Аппаратные ресурсы и ОС (Чеки 1-5) ─────────────────
-    box_top "1/5 · СИСТЕМА И РЕСУРСЫ (ЧЕКИ 1–5)"
+    box_top "1/6 · СИСТЕМА И РЕСУРСЫ (ЧЕКИ 1–5)"
 
     local cores load1
     cores=$(nproc 2>/dev/null || echo 1)
@@ -786,7 +993,7 @@ EOF
     echo
 
     # ── Блок 2: Сетевой стек ядра sysctl (Чеки 6-13) ───────────────
-    box_top "2/5 · СЕТЕВОЙ СТЕК ЯДРА И SYSCTL (ЧЕКИ 6–13)"
+    box_top "2/6 · СЕТЕВОЙ СТЕК ЯДРА И SYSCTL (ЧЕКИ 6–13)"
 
     local tcp_cc
     tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "cubic")
@@ -868,7 +1075,7 @@ EOF
     echo
 
     # ── Блок 3: Сетевой интерфейс, RPS, NIC, MSS, Сервисы (14-18) ──
-    box_top "3/5 · СЕТЕВАЯ КАРТА, RPS, MSS И СИСТЕМНЫЕ СЛУЖБЫ (ЧЕКИ 14–18)"
+    box_top "3/6 · СЕТЕВАЯ КАРТА, RPS, MSS И СИСТЕМНЫЕ СЛУЖБЫ (ЧЕКИ 14–18)"
     local iface
     iface=$(detect_default_iface)
 
@@ -877,9 +1084,9 @@ EOF
         rps_val=$(tr -d '0,\n ' < "/sys/class/net/${iface}/queues/rx-0/rps_cpus" 2>/dev/null || true)
     fi
     if [ "$cores" -le 1 ] || [ -n "$rps_val" ]; then
-        _chk_ok "14. Балансировка RPS/RFS" "Активна на интерфейсе ${iface:-?}"
+        _chk_ok "14. Балансировка RPS/XPS" "Активна на интерфейсе ${iface:-?}"
     else
-        _chk_warn "14. Балансировка RPS/RFS" "RPS выключен на ${iface:-eth0} (сеть на 1 ядре)"
+        _chk_warn "14. Балансировка RPS/XPS" "RPS выключен на ${iface:-eth0} (сеть на 1 ядре)"
         _mark_finding "NEED_RPS"
     fi
 
@@ -894,10 +1101,12 @@ EOF
         _mark_finding "NEED_NIC"
     fi
 
-    if command -v iptables >/dev/null 2>&1 && iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-        _chk_ok "16. TCPMSS Clamp to PMTU" "Правило mangle OUTPUT активно"
+    if command -v iptables >/dev/null 2>&1 \
+       && iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+       && iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        _chk_ok "16. TCPMSS Clamp to PMTU" "Правила mangle OUTPUT + FORWARD активны"
     else
-        _chk_warn "16. TCPMSS Clamp to PMTU" "Не активно (возможны зависания TLS при узком MTU)"
+        _chk_warn "16. TCPMSS Clamp to PMTU" "Не активно на OUTPUT/FORWARD (возможен PMTU blackhole)"
         _mark_finding "NEED_MSS"
     fi
 
@@ -918,7 +1127,7 @@ EOF
     echo
 
     # ── Блок 4: Контейнеры RemnawaveNode и Caddy Selfsteal L4 (19-23) ─
-    box_top "4/5 · DOCKER, REMNANODE И CADDY L4 SELFSTEAL (ЧЕКИ 19–23)"
+    box_top "4/6 · DOCKER, REMNANODE И CADDY L4 SELFSTEAL (ЧЕКИ 19–23)"
     local node_port caddy_port caddy_domain xhttp_domain
     node_port=$(get_saved_node_port)
     caddy_port=$(get_saved_caddy_port)
@@ -981,7 +1190,7 @@ EOF
     echo
 
     # ── Блок 5: Периметр безопасности и связность (Чеки 24-27) ────
-    box_top "5/5 · ЗАЩИТА ПЕРИМЕТРА И СВЯЗНОСТЬ (ЧЕКИ 24–27)"
+    box_top "5/6 · ЗАЩИТА ПЕРИМЕТРА И СВЯЗНОСТЬ (ЧЕКИ 24–27)"
     local panel_ip ufw_out=""
     panel_ip=$(get_saved_panel_ip)
     if command -v ufw >/dev/null 2>&1; then
@@ -1031,16 +1240,151 @@ EOF
     box_bottom
     echo
 
-    box_top "ВЕРДИКТ ДИАГНОСТИКИ (27 ЧЕКОВ)"
-    box_row "Успешно: ${GREEN}${BOLD}${pass_cnt}${NC}   |   Предупреждений: ${YELLOW}${BOLD}${warn_cnt}${NC}   |   Ошибок: ${RED}${BOLD}${fail_cnt}${NC}"
+    # ── Блок 6: Углубленный аудит ядра, сокетов, портов и репутации (Чеки 28-33) ─
+    box_top "6/6 · PSI, UDP-БУФЕРЫ, MSS-КОЛЛАПС, ПОРТЫ И РЕПУТАЦИЯ (ЧЕКИ 28–33)"
+
+    # 28. PSI (/proc/pressure)
+    if [ -d /proc/pressure ]; then
+        local psi_cpu="0.00" psi_mem="0.00" psi_io="0.00"
+        [ -r /proc/pressure/cpu ]    && psi_cpu=$(awk '/^some/{for(i=1;i<=NF;i++)if($i~/^avg10=/){sub("avg10=","",$i);print $i;exit}}' /proc/pressure/cpu 2>/dev/null || echo "0.00")
+        [ -r /proc/pressure/memory ] && psi_mem=$(awk '/^some/{for(i=1;i<=NF;i++)if($i~/^avg10=/){sub("avg10=","",$i);print $i;exit}}' /proc/pressure/memory 2>/dev/null || echo "0.00")
+        [ -r /proc/pressure/io ]     && psi_io=$(awk '/^some/{for(i=1;i<=NF;i++)if($i~/^avg10=/){sub("avg10=","",$i);print $i;exit}}' /proc/pressure/io 2>/dev/null || echo "0.00")
+        if awk -v c="${psi_cpu:-0}" -v m="${psi_mem:-0}" -v io="${psi_io:-0}" 'BEGIN{exit !(c<10 && m<10 && io<10)}'; then
+            _chk_ok "28. PSI Давление ресурсов" "avg10: cpu=${psi_cpu}% mem=${psi_mem}% io=${psi_io}%"
+        else
+            _chk_warn "28. PSI Давление ресурсов" "Высокое ожидание PSI: cpu=${psi_cpu}% mem=${psi_mem}% io=${psi_io}%"
+        fi
+    else
+        _chk_ok "28. PSI Давление ресурсов" "Пропущено (CONFIG_PSI не активен)"
+    fi
+
+    # 29. UDP RcvbufErrors / SndbufErrors (/proc/net/snmp)
+    local udp_rcv_err=0 udp_snd_err=0
+    if [ -r /proc/net/snmp ]; then
+        while IFS='=' read -r uk uv; do
+            case "$uk" in
+                RcvbufErrors) udp_rcv_err="${uv:-0}" ;;
+                SndbufErrors) udp_snd_err="${uv:-0}" ;;
+            esac
+        done < <(awk '/^Udp:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++)printf "%s=%d\n",n[i],$i}' /proc/net/snmp 2>/dev/null)
+    fi
+    if [ "${udp_rcv_err:-0}" -le 1000 ]; then
+        _chk_ok "29. Ошибки буферов UDP/QUIC" "RcvbufErrors=${udp_rcv_err}, SndbufErrors=${udp_snd_err}"
+    else
+        _chk_warn "29. Ошибки буферов UDP/QUIC" "Дропы UDP буфера: RcvbufErrors=${udp_rcv_err} (нужен тюнинг sysctl)"
+        _mark_finding "NEED_SYSCTL"
+    fi
+
+    # 30. Живые сокеты: MSS-коллапс (<256) и переполнение Accept-Queue
+    local mss_low=0 full_q=""
+    if command -v ss >/dev/null 2>&1; then
+        mss_low=$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2<256{c++} END{print c+0}')
+        full_q=$(ss -tlnH 2>/dev/null | awk '$1=="LISTEN" && $3+0>0 && $2+0>=$3+0 {print $4}' | head -3 | tr '\n' ' ')
+    fi
+    if [ "${mss_low:-0}" -eq 0 ] && [ -z "$full_q" ]; then
+        _chk_ok "30. Живые сокеты (MSS/Queue)" "Коллапсов MSS<256 нет, Accept-Queue в норме"
+    else
+        _chk_warn "30. Живые сокеты (MSS/Queue)" "MSS<256: ${mss_low} сок.${full_q:+ | Переполнена очередь: $full_q}"
+        _mark_finding "NEED_SYSCTL"
+        _mark_finding "NEED_MSS"
+    fi
+
+    # 31. Туннели, NetBird и стек мониторинга (VictoriaMetrics/NodeExporter/cAdvisor)
+    local tun_info=()
+    if check_existing_netbird; then
+        if netbird status 2>/dev/null | grep -qi "connected"; then
+            local nb_ip
+            nb_ip=$(ip -4 addr show wt0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
+            tun_info+=("NetBird:OK(${nb_ip:-wt0})")
+        else
+            tun_info+=("NetBird:WARN(disconnected)")
+        fi
+    fi
+    if check_existing_monitoring; then
+        if systemctl is-active --quiet vmagent 2>/dev/null && systemctl is-active --quiet nodeexporter 2>/dev/null; then
+            tun_info+=("Monitoring:OK(vmagent+exporters)")
+        else
+            tun_info+=("Monitoring:WARN(stopped)")
+        fi
+    fi
+    if [ ${#tun_info[@]} -eq 0 ]; then
+        _chk_ok "31. Агенты NetBird & Метрики" "Не установлены (опциональные модули)"
+    elif [[ "${tun_info[*]}" == *"WARN"* ]]; then
+        _chk_warn "31. Агенты NetBird & Метрики" "${tun_info[*]}"
+    else
+        _chk_ok "31. Агенты NetBird & Метрики" "${tun_info[*]}"
+    fi
+
+    # 32. Аудит публично открытых портов (0.0.0.0 / [::])
+    local danger_ports="" extra_ports="" ssh_p_cur
+    ssh_p_cur=$(detect_ssh_port)
+    if command -v ss >/dev/null 2>&1; then
+        local pub_ports
+        pub_ports=$(ss -tulnp 2>/dev/null | tail -n +2 | awk '
+            $5 ~ /^(0\.0\.0\.0|\[::\]|\*):[0-9]+$/ {
+                p=$5; sub(/.*:/,"",p); print p
+            }' | sort -u -n)
+        local p_item
+        for p_item in $pub_ports; do
+            case "$p_item" in
+                80|443|"$ssh_p_cur"|"$node_port"|51820) ;;
+                2375|2376|5432|3306|6379|27017|9200) danger_ports="${danger_ports}${p_item} " ;;
+                *) extra_ports="${extra_ports}${p_item} " ;;
+            esac
+        done
+    fi
+    if [ -n "$danger_ports" ]; then
+        _chk_fail "32. Аудит открытых портов" "ОПАСНЫЕ ПОРТЫ НАРУЖУ: ${danger_ports}(закройте через UFW/protect!)"
+        _mark_finding "NEED_UFW_FIX"
+    elif [ -n "$extra_ports" ]; then
+        _chk_warn "32. Аудит открытых портов" "Нестандартные внешние порты: ${extra_ports}"
+    else
+        _chk_ok "32. Аудит открытых портов" "Слушают только штатные порты (80, 443, SSH, Node)"
+    fi
+
+    # 33. IP-репутация, Cloudflare Trace и доступность сервисов (YouTube / Google / ChatGPT / Gemini)
+    if [ "$mode" != "--no-net" ] && [ "$mode" != "-q" ]; then
+        local cf_trace cf_colo="?" cf_loc="?" g_code="000" yt_code="000" ai_code="000"
+        cf_trace=$(curl -4 -sS --connect-timeout 4 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+        if [ -n "$cf_trace" ]; then
+            cf_colo=$(awk -F= '/^colo=/{print $2}' <<< "$cf_trace")
+            cf_loc=$(awk -F= '/^loc=/{print $2}' <<< "$cf_trace")
+        fi
+        yt_code=$(curl -4 -sS -o /dev/null --connect-timeout 4 --max-time 6 -w "%{http_code}" "https://www.youtube.com/" 2>/dev/null || echo "000")
+        g_code=$(curl -4 -sS -o /dev/null --connect-timeout 4 --max-time 6 -w "%{http_code}" "https://www.google.com/generate_204" 2>/dev/null || echo "000")
+        ai_code=$(curl -4 -sS -o /dev/null --connect-timeout 4 --max-time 6 -w "%{http_code}" "https://chatgpt.com/" 2>/dev/null || echo "000")
+        if [[ "$yt_code" =~ ^(200|301|302)$ ]] && [[ "$g_code" =~ ^(200|204)$ ]]; then
+            _chk_ok "33. Репутация IP и Сервисы" "CF=${cf_colo}/${cf_loc} | YouTube=${yt_code} | Google=${g_code} | ChatGPT=${ai_code}"
+        else
+            _chk_warn "33. Репутация IP и Сервисы" "CF=${cf_colo}/${cf_loc} | YouTube=${yt_code} | Google=${g_code} | ChatGPT=${ai_code}"
+        fi
+    else
+        _chk_ok "33. Репутация IP и Сервисы" "Пропущено (${mode})"
+    fi
+    box_bottom
+    echo
+
+    local score=$(( 100 - fail_cnt * 12 - warn_cnt * 4 ))
+    [ "$score" -lt 0 ] && score=0
+
+    box_top "ВЕРДИКТ ДИАГНОСТИКИ (33 ЧЕКА · ОЦЕНКА: ${score}/100)"
+    box_row "Успешно: ${GREEN}${BOLD}${pass_cnt}${NC}   |   Предупреждений: ${YELLOW}${BOLD}${warn_cnt}${NC}   |   Ошибок: ${RED}${BOLD}${fail_cnt}${NC}   |   Сводка: ${DIM}${summary_txt}${NC}"
     if [ $fail_cnt -eq 0 ] && [ $warn_cnt -eq 0 ]; then
         box_row "${GREEN}${BOLD}Идеальное состояние! Узел полностью оптимизирован и защищен.${NC}"
     else
         box_row "${SLATE}Для авто-исправления находок запустите: ${ORANGE}${BOLD}node-mgr optimize --from-findings${NC}"
         box_row "${SLATE}Для полного профиля оптимизации:       ${ORANGE}${BOLD}node-mgr optimize --all${NC}"
+        box_row "${SLATE}Для генерации nftables/SSH защиты:     ${ORANGE}${BOLD}node-mgr protect${NC}"
     fi
     box_bottom
     echo
+
+    if [ "$emit_json_mode" = true ]; then
+        exec 1>&3
+        printf '{"version":"%s","host":"%s","ip":"%s","ts":"%s","score":%d,"pass":%d,"warn":%d,"fail":%d,"summary_file":"%s"}\n' \
+            "$SCRIPT_VERSION" "$(hostname 2>/dev/null || echo node)" "${NODE_IP:-0.0.0.0}" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$score" "$pass_cnt" "$warn_cnt" "$fail_cnt" "$summary_txt"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1085,9 +1429,17 @@ opt_sysctl() {
         BBR_ALGO="bbr"
     fi
 
+    local QDISC_ALGO="fq"
+    if modprobe sch_cake 2>/dev/null || [ -d /sys/module/sch_cake ]; then
+        QDISC_ALGO="cake"
+    fi
+
     modprobe nf_conntrack 2>/dev/null || true
     mkdir -p /etc/modules-load.d /etc/modprobe.d
-    echo "nf_conntrack" > "/etc/modules-load.d/${ND_DROPIN_PREFIX}.conf"
+    {
+        echo "nf_conntrack"
+        [ "$QDISC_ALGO" = "cake" ] && echo "sch_cake"
+    } > "/etc/modules-load.d/${ND_DROPIN_PREFIX}.conf"
     echo "options nf_conntrack hashsize=${conntrack_buckets}" > "/etc/modprobe.d/${ND_DROPIN_PREFIX}-conntrack.conf"
     if [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
         echo "$conntrack_buckets" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
@@ -1109,10 +1461,11 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 0
 net.ipv4.ip_forward = 1
 
-net.core.default_qdisc = fq
+net.core.default_qdisc = ${QDISC_ALGO}
 net.ipv4.tcp_congestion_control = ${BBR_ALGO}
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_ecn = 2
 
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${rmem_max}
@@ -1141,6 +1494,7 @@ net.ipv4.tcp_max_tw_buckets = 262144
 net.ipv4.tcp_max_orphans = 65536
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_min_snd_mss = 512
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 3
@@ -1154,8 +1508,9 @@ net.ipv4.tcp_keepalive_probes = 3
 -net.netfilter.nf_conntrack_udp_timeout = 15
 -net.netfilter.nf_conntrack_udp_timeout_stream = 60
 
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.src_valid_mark = 1
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -1165,13 +1520,13 @@ vm.overcommit_memory = 1
 EOF
 
     sysctl --system >/dev/null 2>&1 || true
-    _log_fix "sysctl profile applied (${profile_tier}, ${BBR_ALGO}, conntrack=${conntrack_max})"
-    log_success "Профиль sysctl применен (${profile_tier}, ${BBR_ALGO})"
+    _log_fix "sysctl profile applied (${profile_tier}, ${BBR_ALGO}+${QDISC_ALGO}, conntrack=${conntrack_max})"
+    log_success "Профиль sysctl применен (${profile_tier}, ${BBR_ALGO}+${QDISC_ALGO})"
 }
 
 opt_limits() {
     log_info "Настройка системных лимитов дескрипторов (PAM & Systemd)..."
-    mkdir -p /etc/security/limits.d /etc/systemd/system.conf.d
+    mkdir -p /etc/security/limits.d /etc/systemd/system.conf.d /etc/systemd/user.conf.d
     cat > "/etc/security/limits.d/${ND_DROPIN_PREFIX}-limits.conf" << 'EOF'
 *    soft nofile 1048576
 *    hard nofile 1048576
@@ -1186,16 +1541,17 @@ EOF
     cat > "/etc/systemd/system.conf.d/${ND_DROPIN_PREFIX}-limits.conf" << 'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=65535
+DefaultLimitNPROC=1048576
 EOF
+    cp -f "/etc/systemd/system.conf.d/${ND_DROPIN_PREFIX}-limits.conf" "/etc/systemd/user.conf.d/${ND_DROPIN_PREFIX}-limits.conf" 2>/dev/null || true
     ulimit -n 1048576 2>/dev/null || true
     systemctl daemon-reexec 2>/dev/null || true
-    _log_fix "FD limits set to 1048576"
+    _log_fix "FD limits set to 1048576 (PAM + systemd system/user)"
     log_success "Лимиты файловых дескрипторов установлены (1048576)"
 }
 
 opt_rps() {
-    log_info "Настройка Receive Packet Steering (RPS/RFS) по всем ядрам CPU..."
+    log_info "Настройка Receive/Transmit Packet Steering (RPS/RFS/XPS) по всем ядрам CPU..."
     cat > /usr/local/sbin/node-mgr-rps << 'EOF'
 #!/usr/bin/env bash
 cores=$(nproc 2>/dev/null || echo 1)
@@ -1221,13 +1577,20 @@ for iface_dir in /sys/class/net/*; do
     iface=$(basename "$iface_dir")
     if [ "$iface" = "lo" ]; then continue; fi
     rx_queues=( "${iface_dir}/queues/rx-"* )
-    if [ ! -d "${rx_queues[0]}" ]; then continue; fi
-    rx_cnt=${#rx_queues[@]}
-    flow_cnt=$(( entries / rx_cnt ))
-    for q in "${rx_queues[@]}"; do
-        echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
-        echo "$flow_cnt" > "$q/rps_flow_cnt" 2>/dev/null || true
-    done
+    if [ -d "${rx_queues[0]}" ]; then
+        rx_cnt=${#rx_queues[@]}
+        flow_cnt=$(( entries / rx_cnt ))
+        for q in "${rx_queues[@]}"; do
+            echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
+            echo "$flow_cnt" > "$q/rps_flow_cnt" 2>/dev/null || true
+        done
+    fi
+    tx_queues=( "${iface_dir}/queues/tx-"* )
+    if [ -d "${tx_queues[0]}" ]; then
+        for tq in "${tx_queues[@]}"; do
+            [ -w "$tq/xps_cpus" ] && echo "$mask" > "$tq/xps_cpus" 2>/dev/null || true
+        done
+    fi
 done
 EOF
     chmod 755 /usr/local/sbin/node-mgr-rps
@@ -1235,7 +1598,7 @@ EOF
 
     cat > /etc/systemd/system/node-diagnostic-rps.service << 'EOF'
 [Unit]
-Description=LissVPN RPS/RFS Multi-Queue Packet Steering
+Description=LissVPN RPS/RFS/XPS Multi-Queue Packet Steering
 After=network-online.target
 
 [Service]
@@ -1248,12 +1611,12 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now node-diagnostic-rps.service >/dev/null 2>&1 || true
-    _log_fix "RPS/RFS packet steering enabled"
-    log_success "RPS/RFS распределение пакетов по ядрам активировано"
+    _log_fix "RPS/RFS/XPS packet steering enabled"
+    log_success "RPS/RFS/XPS распределение пакетов по ядрам активировано"
 }
 
 opt_nic() {
-    log_info "Тюнинг сетевой карты (GRO/GSO/TSO offloads, txqueuelen 10000 & TCPMSS)..."
+    log_info "Тюнинг сетевой карты (GRO/GSO/TSO on, LRO off, txqueuelen 10000 & TCPMSS)..."
     if ! command -v ethtool >/dev/null 2>&1; then
         install_package ethtool >/dev/null 2>&1 || true
     fi
@@ -1263,7 +1626,7 @@ iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
 if [ -n "$iface" ]; then
     ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
     if command -v ethtool >/dev/null 2>&1; then
-        ethtool -K "$iface" gro on gso on tso on 2>/dev/null || true
+        ethtool -K "$iface" gro on gso on tso on lro off 2>/dev/null || true
         ethtool -G "$iface" rx 4096 tx 4096 2>/dev/null || true
     fi
 fi
@@ -1294,8 +1657,8 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now node-diagnostic-nic.service >/dev/null 2>&1 || true
-    _log_fix "NIC offloads (GRO/GSO/TSO), txqueuelen=10000 & TCPMSS applied"
-    log_success "Аппаратные оффлоады NIC, txqueuelen=10000 и TCPMSS настроены"
+    _log_fix "NIC offloads (GRO/GSO/TSO on, LRO off), txqueuelen=10000 & TCPMSS applied"
+    log_success "Аппаратные оффлоады NIC (LRO off), txqueuelen=10000 и TCPMSS настроены"
 }
 
 opt_mss() {
@@ -1383,9 +1746,71 @@ EOF
     log_success "Zram-swap успешно активирован"
 }
 
+opt_shaper() {
+    local bw_mbit="${1:-}"
+    local def_if
+    def_if=$(detect_default_iface)
+    if [ -z "$def_if" ]; then
+        log_error "Не удалось определить основной сетевой интерфейс для шейпинга"
+        return 1
+    fi
+
+    if [ -z "$bw_mbit" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
+        local link_spd=""
+        link_spd=$(cat "/sys/class/net/${def_if}/speed" 2>/dev/null || echo "")
+        local def_bw="950"
+        if [[ "$link_spd" =~ ^[0-9]+$ ]] && [ "$link_spd" -gt 10 ] && [ "$link_spd" -le 25000 ]; then
+            def_bw=$(( link_spd * 95 / 100 ))
+        fi
+        read -p "  ${ORANGE}>${NC} Лимит канала для CAKE Fair Queueing в Мбит/с (95% от порта VPS) [${def_bw}]: " -r bw_mbit
+        bw_mbit="${bw_mbit:-$def_bw}"
+    fi
+    bw_mbit="${bw_mbit:-950}"
+    if ! [[ "$bw_mbit" =~ ^[0-9]+$ ]] || [ "$bw_mbit" -lt 10 ]; then
+        bw_mbit=950
+    fi
+
+    log_info "Настройка Smart Traffic Shaper (CAKE dual-srchost / fq_codel) на ${def_if} (${bw_mbit} Mbit/s)..."
+    modprobe sch_cake 2>/dev/null || true
+
+    cat > /usr/local/sbin/node-mgr-shaper << EOF
+#!/usr/bin/env bash
+IFACE="${def_if}"
+BW="${bw_mbit}mbit"
+modprobe sch_cake 2>/dev/null || true
+if tc qdisc replace dev "\$IFACE" root cake bandwidth "\$BW" diffserv4 nat dual-srchost 2>/dev/null; then
+    exit 0
+fi
+tc qdisc replace dev "\$IFACE" root fq_codel 2>/dev/null || true
+EOF
+    chmod 755 /usr/local/sbin/node-mgr-shaper
+    /usr/local/sbin/node-mgr-shaper || true
+
+    cat > /etc/systemd/system/node-diagnostic-shaper.service << EOF
+[Unit]
+Description=LissVPN Smart Traffic Shaper (CAKE Fair Queueing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/node-mgr-shaper
+ExecStop=/sbin/tc qdisc replace dev ${def_if} root fq
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now node-diagnostic-shaper.service >/dev/null 2>&1 || true
+    _log_fix "CAKE traffic shaper enabled on ${def_if} (${bw_mbit}mbit, dual-srchost)"
+    log_success "Smart Traffic Shaper активирован на ${def_if} (${bw_mbit} Мбит/с, честное деление канала между клиентами)"
+}
+
 run_optimize() {
     _init_env
     local flag="${1:---all}"
+    local arg2="${2:-}"
     print_header "ОПТИМИЗАЦИЯ И ТЮНИНГ УЗЛА (${flag})"
 
     case "$flag" in
@@ -1415,14 +1840,15 @@ run_optimize() {
             if grep -q "^NEED_UFW_FIX=1" "$FINDINGS_FILE" 2>/dev/null; then setup_ufw; fi
             if grep -q "^NEED_F2B_FIX=1" "$FINDINGS_FILE" 2>/dev/null; then install_fail2ban; fi
             ;;
-        --zram)       opt_zram ;;
-        --sysctl)     opt_sysctl ;;
-        --limits)     opt_limits ;;
-        --rps)        opt_rps ;;
-        --nic)        opt_nic ;;
-        --mss)        opt_mss ;;
-        --irqbalance) opt_irqbalance ;;
-        --journald)   opt_journald ;;
+        --zram)            opt_zram ;;
+        --shaper|--shape)  opt_shaper "$arg2" ;;
+        --sysctl)          opt_sysctl ;;
+        --limits)          opt_limits ;;
+        --rps)             opt_rps ;;
+        --nic)             opt_nic ;;
+        --mss)             opt_mss ;;
+        --irqbalance)      opt_irqbalance ;;
+        --journald)        opt_journald ;;
         *)
             opt_sysctl
             opt_limits
@@ -1444,15 +1870,22 @@ run_rollback() {
     rm -f "/etc/sysctl.d/${ND_DROPIN_PREFIX}-sysctl.conf" \
           "/etc/security/limits.d/${ND_DROPIN_PREFIX}-limits.conf" \
           "/etc/systemd/system.conf.d/${ND_DROPIN_PREFIX}-limits.conf" \
+          "/etc/systemd/user.conf.d/${ND_DROPIN_PREFIX}-limits.conf" \
           "/etc/modules-load.d/${ND_DROPIN_PREFIX}.conf" \
           "/etc/modprobe.d/${ND_DROPIN_PREFIX}-conntrack.conf" \
           "/etc/systemd/journald.conf.d/${ND_DROPIN_PREFIX}.conf" 2>/dev/null || true
 
-    for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram; do
+    for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram node-diagnostic-shaper; do
         systemctl disable --now "${svc}.service" 2>/dev/null || true
         rm -f "/etc/systemd/system/${svc}.service"
     done
-    rm -f /usr/local/sbin/node-mgr-rps /usr/local/sbin/node-mgr-nic /usr/local/sbin/node-mgr-zram
+    rm -f /usr/local/sbin/node-mgr-rps /usr/local/sbin/node-mgr-nic /usr/local/sbin/node-mgr-zram /usr/local/sbin/node-mgr-shaper
+
+    local def_if
+    def_if=$(detect_default_iface)
+    if [ -n "$def_if" ] && command -v tc >/dev/null 2>&1; then
+        tc qdisc replace dev "$def_if" root fq 2>/dev/null || true
+    fi
 
     if command -v iptables >/dev/null 2>&1; then
         iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -1474,7 +1907,17 @@ run_bbr3_xanmod() {
         return 1
     fi
 
-    local xanmod_level="x64v1"
+    local virt_type
+    virt_type=$(detect_virt)
+    case "$virt_type" in
+        lxc|lxc-libvirt|openvz|docker|podman|systemd-nspawn)
+            log_error "Контейнерная виртуализация ($virt_type): ядро общее с хостом, замена невозможна"
+            return 1
+            ;;
+    esac
+
+    local cpu_model xanmod_level="x64v1"
+    cpu_model=$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "unknown")
     if grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
         xanmod_level="x64v4"
     elif grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
@@ -1482,25 +1925,61 @@ run_bbr3_xanmod() {
     elif grep -q "sse4_2" /proc/cpuinfo 2>/dev/null; then
         xanmod_level="x64v2"
     fi
-    log_info "Текущее ядро: $(uname -r) | Выбран профиль CPU: ${ORANGE}${xanmod_level}${NC}"
+    log_info "Текущее ядро: $(uname -r) | CPU: ${cpu_model} | Профиль ISA: ${ORANGE}${xanmod_level}${NC}"
+    if echo "$cpu_model" | grep -qiE 'QEMU Virtual CPU|Common KVM processor|Common 32-bit KVM|kvm64|qemu64'; then
+        log_warning "Гипервизор маскирует модель CPU (${cpu_model}) — выбран безопасный профиль ${xanmod_level}"
+    fi
 
-    if ! prompt_yn "Установить пакет linux-xanmod-${xanmod_level} (потребуется перезагрузка)? (y/n): " "y"; then
+    local codename=""
+    codename=$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}" || true)
+    [ -z "$codename" ] && codename=$(lsb_release -cs 2>/dev/null || echo "releases")
+    local suite="$codename"
+    local http_code
+    http_code=$(curl -fsSL -o /dev/null -w '%{http_code}' --connect-timeout 6 "https://deb.xanmod.org/dists/${suite}/Release" 2>/dev/null || echo "000")
+    if [ "$http_code" != "200" ]; then
+        http_code=$(curl -fsSL -o /dev/null -w '%{http_code}' --connect-timeout 6 "https://deb.xanmod.org/dists/releases/Release" 2>/dev/null || echo "000")
+        if [ "$http_code" = "200" ]; then
+            suite="releases"
+        else
+            log_error "Репозиторий XanMod не отвечает или не поддерживает дистрибутив '${codename}' (HTTP ${http_code})"
+            return 1
+        fi
+    fi
+
+    if ! prompt_yn "Установить пакет linux-xanmod-${xanmod_level} из ветки '${suite}' (потребуется перезагрузка)? (y/n): " "y"; then
         return 0
     fi
 
     if ! command -v gpg >/dev/null 2>&1; then install_package gnupg; fi
     local xanmod_key="/usr/share/keyrings/xanmod-archive-keyring.gpg"
-    curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o "$xanmod_key"
-    echo "deb [signed-by=$xanmod_key] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
+    local raw_key
+    raw_key=$(create_temp_file)
+    if ! curl -fsSL --connect-timeout 10 https://dl.xanmod.org/archive.key -o "$raw_key"; then
+        log_error "Не удалось скачать GPG-ключ XanMod"
+        return 1
+    fi
+    local expected_fpr="D38D7D1DA1349567ADED882D86F7D09EE734E623"
+    local got_fpr
+    got_fpr=$(gpg --batch --with-colons --import-options show-only --import < "$raw_key" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}' || true)
+    if [ -n "$got_fpr" ] && [ "$got_fpr" != "$expected_fpr" ]; then
+        log_error "Несовпадение GPG fingerprint ключа XanMod: получен ${got_fpr}, ожидался ${expected_fpr}"
+        return 1
+    fi
+    gpg --batch --yes --dearmor -o "$xanmod_key" < "$raw_key"
+    echo "deb [signed-by=$xanmod_key] https://deb.xanmod.org ${suite} main" > /etc/apt/sources.list.d/xanmod-release.list
     apt-get update -qq >/dev/null 2>&1
 
     log_info "Установка linux-xanmod-${xanmod_level}..."
     if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "linux-xanmod-${xanmod_level}"; then
         _log_fix "XanMod kernel (${xanmod_level}) installed"
         log_success "Ядро XanMod (${xanmod_level}) успешно установлено!"
+        local k_cnt
+        k_cnt=$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | wc -l)
+        log_info "Пре-ребут проверка: ядер в /boot = ${k_cnt} (старое ядро сохранено для отката в GRUB)"
         log_warning "Выполните 'reboot' в удобное время для загрузки с ядром BBRv3."
     else
         log_error "Не удалось установить пакет ядра XanMod"
+        rm -f /etc/apt/sources.list.d/xanmod-release.list
         return 1
     fi
 }
@@ -1584,8 +2063,13 @@ install_xray_core() {
     fi
 
     local api_response latest_release
-    api_response=$(curl -s --connect-timeout 10 --max-time 25 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null) || true
+    # У XTLS релизы помечаются pre-release, поэтому берем первый из /releases?per_page=1
+    api_response=$(curl -s --connect-timeout 10 --max-time 25 "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1" 2>/dev/null) || true
     latest_release=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+    if [ -z "$latest_release" ]; then
+        api_response=$(curl -s --connect-timeout 10 --max-time 25 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null) || true
+        latest_release=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+    fi
     if [ -z "$latest_release" ]; then return 1; fi
 
     local xray_filename="Xray-linux-$ARCH.zip"
@@ -1606,6 +2090,9 @@ generate_x25519_keypair() {
     local out=""
     if [ -x "$REMNANODE_DATA_DIR/xray" ]; then
         out=$("$REMNANODE_DATA_DIR/xray" x25519 2>/dev/null || true)
+    fi
+    if [ -z "$out" ] && is_container_running "remnanode"; then
+        out=$(docker exec remnanode xray x25519 2>/dev/null || true)
     fi
     if [ -z "$out" ] && command -v docker >/dev/null 2>&1; then
         out=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>/dev/null || true)
@@ -1817,6 +2304,39 @@ install_caddy_selfsteal() {
     SELF_STEAL_PORT="$port"
     DETAIL_CADDY_PORT="$port"
 
+    # Выбор типа сертификата: 1 = HTTP-01 (стандарт), 2 = DNS-01 (Cloudflare API Token)
+    local cert_choice="${CFG_CERT_TYPE:-1}"
+    local cf_token="${CFG_CLOUDFLARE_TOKEN:-}"
+    if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        echo -e "  ${WHITE}Способ выпуска SSL-сертификатов Let's Encrypt:${NC}"
+        echo -e "    ${ORANGE}1)${NC} Обычный HTTP-01 challenge (по умолчанию, без токенов)"
+        echo -e "    ${ORANGE}2)${NC} Cloudflare DNS-01 challenge (через Cloudflare API Token)"
+        prompt_choice "Выберите способ [1-2, Enter=1]: " 2 cert_choice "${CFG_CERT_TYPE:-1}"
+    fi
+    if [ "$cert_choice" = "2" ]; then
+        if [ -z "$cf_token" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
+            while [ -z "$cf_token" ]; do
+                read -s -p "  ${ORANGE}>${NC} Введите Cloudflare API Token (Zone:Read, DNS:Edit): " -r cf_token
+                echo
+                cf_token=$(echo "$cf_token" | tr -d '\r\n ' | sed 's/[^a-zA-Z0-9_-]//g')
+            done
+        fi
+        if [ -n "$cf_token" ]; then
+            validate_cloudflare_token "$cf_token" || log_warning "Продолжаем с указанным Cloudflare API Token"
+            CFG_CERT_TYPE="2"
+            CFG_CLOUDFLARE_TOKEN="$cf_token"
+        else
+            log_warning "Cloudflare API Token не задан — переключаемся на стандартный HTTP-01"
+            cert_choice="1"
+        fi
+    fi
+
+    # Проверка DNS перед стартом Caddy (в интерактивном режиме)
+    if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        validate_domain_dns "$SELF_STEAL_DOMAIN" "$NODE_IP" || true
+        validate_domain_dns "$XHTTP_STEAL_DOMAIN" "$NODE_IP" || true
+    fi
+
     # 1. Создание /opt/html/index.html и директории /opt/selfsteel
     mkdir -p "$CADDY_DIR" "$CADDY_HTML_DIR" "$CADDY_DIR/logs"
     touch "$CADDY_DIR/logs/access.log"
@@ -1838,57 +2358,78 @@ XHTTP_STEAL_DOMAIN=${XHTTP_STEAL_DOMAIN}
 SELF_STEAL_PORT=${SELF_STEAL_PORT}
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
+${cf_token:+CLOUDFLARE_API_TOKEN=${cf_token}}
 EOF
     chmod 600 "$CADDY_DIR/.env"
     umask 022
 
-    # 3. Генерация Dockerfile для сборки Caddy с модулем github.com/mholt/caddy-l4
-    cat > "$CADDY_DIR/Dockerfile" << 'EOF'
+    # 3. Генерация Dockerfile для сборки Caddy с модулем github.com/mholt/caddy-l4 (+ cloudflare при DNS-01)
+    if [ "$cert_choice" = "2" ]; then
+        cat > "$CADDY_DIR/Dockerfile" << 'EOF'
+FROM caddy:2-builder AS builder
+RUN xcaddy build --with github.com/mholt/caddy-l4 --with github.com/caddy-dns/cloudflare
+
+FROM caddy:2
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+EOF
+    else
+        cat > "$CADDY_DIR/Dockerfile" << 'EOF'
 FROM caddy:2-builder AS builder
 RUN xcaddy build --with github.com/mholt/caddy-l4
 
 FROM caddy:2
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 EOF
+    fi
+
+    local tls_block_cfg=""
+    if [ "$cert_choice" = "2" ]; then
+        tls_block_cfg="dns cloudflare {env.CLOUDFLARE_API_TOKEN}"
+    else
+        tls_block_cfg="issuer acme {
+            disable_tlsalpn_challenge
+        }"
+    fi
 
     # 4. Генерация /opt/selfsteel/Caddyfile (L4 SNI-роутинг на :443 + Selfsteal HTTPS на 127.0.0.1:9443)
-    cat > "$CADDY_DIR/Caddyfile" << 'EOF'
+    cat > "$CADDY_DIR/Caddyfile" << EOF
 {
-    https_port {$SELF_STEAL_PORT}
+    https_port {\$SELF_STEAL_PORT}
     default_bind 127.0.0.1
     auto_https disable_redirects
+    admin off
 
     layer4 {
         0.0.0.0:443 {
-            @vision tls sni {$SELF_STEAL_DOMAIN}
+            @vision tls sni {\$SELF_STEAL_DOMAIN}
             route @vision {
-                proxy 127.0.0.1:{$VISION_INBOUND_PORT}
+                proxy 127.0.0.1:{\$VISION_INBOUND_PORT}
             }
 
-            @xhttp tls sni {$XHTTP_STEAL_DOMAIN}
+            @xhttp tls sni {\$XHTTP_STEAL_DOMAIN}
             route @xhttp {
-                proxy 127.0.0.1:{$XHTTP_INBOUND_PORT}
+                proxy 127.0.0.1:{\$XHTTP_INBOUND_PORT}
             }
 
             route {
-                proxy 127.0.0.1:{$SELF_STEAL_PORT}
+                proxy 127.0.0.1:{\$SELF_STEAL_PORT}
             }
         }
     }
 }
 
-http://{$SELF_STEAL_DOMAIN}, http://{$XHTTP_STEAL_DOMAIN} {
+http://{\$SELF_STEAL_DOMAIN}, http://{\$XHTTP_STEAL_DOMAIN} {
     bind 0.0.0.0
     redir https://{host}{uri} permanent
 }
 
-https://{$SELF_STEAL_DOMAIN}, https://{$XHTTP_STEAL_DOMAIN} {
+https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
     tls {
-        issuer acme {
-            disable_tlsalpn_challenge
-        }
+        ${tls_block_cfg}
     }
     root * /var/www/html
+    encode zstd gzip
+    header -Server
     try_files {path} /index.html
     file_server
     log {
@@ -1900,14 +2441,16 @@ https://{$SELF_STEAL_DOMAIN}, https://{$XHTTP_STEAL_DOMAIN} {
     }
 }
 
-:{$SELF_STEAL_PORT} {
+:{\$SELF_STEAL_PORT} {
     tls internal
     respond 204
+    log off
 }
 
 :80 {
     bind 0.0.0.0
     respond 204
+    log off
 }
 EOF
 
@@ -1940,7 +2483,15 @@ EOF
 
     # 6. Сборка (при необходимости) и запуск контейнера Caddy L4 + ожидание сертификатов
     docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
+    local need_build=false
     if ! docker image inspect caddy-l4:local >/dev/null 2>&1; then
+        need_build=true
+    elif [ "$cert_choice" = "2" ]; then
+        if ! docker run --rm caddy-l4:local caddy list-modules 2>/dev/null | grep -q "dns.providers.cloudflare"; then
+            need_build=true
+        fi
+    fi
+    if [ "$need_build" = true ]; then
         log_info "Сборка образа Caddy с модулем layer4 (github.com/mholt/caddy-l4)..."
         docker compose --project-directory "$CADDY_DIR" build
     fi
@@ -2236,9 +2787,11 @@ automate_remnawave_api() {
     local xhttp_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
 
     local clean_node_name="${NODE_NAME//[^a-zA-Z0-9_-]/}"
+    local upper_node_name
+    upper_node_name=$(echo "$clean_node_name" | tr '[:lower:]-' '[:upper:]_' | tr -cd 'A-Z0-9_')
     local profile_name="Profile-${clean_node_name}"
-    local vision_tag="VLESS-REALITY-${clean_node_name}"
-    local xhttp_tag="VLESS-XHTTP-${clean_node_name}"
+    local vision_tag="VLESS_REALITY_${upper_node_name:-NODE}"
+    local xhttp_tag="VLESS_XHTTP_${upper_node_name:-NODE}"
 
     # Генерация ключей Reality (X25519) и shortId
     local keypair priv_key pub_key short_id
@@ -2591,6 +3144,7 @@ automate_remnawave_api() {
             --arg sni "$SELF_STEAL_DOMAIN" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$vision_inbound_uuid" \
+            --arg n_uuid "$node_uuid" \
             '{
                 remark: $remark,
                 address: $addr,
@@ -2598,13 +3152,15 @@ automate_remnawave_api() {
                 sni: $sni,
                 securityLayer: "DEFAULT",
                 fingerprint: "chrome",
+                nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
                     configProfileInboundUuid: $i_uuid
                 }
             }')
 
-        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$vision_host_payload" 2>/dev/null); then
+        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$vision_host_payload" 2>/dev/null) \
+           || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$vision_host_payload" | jq 'del(.nodes)')" 2>/dev/null); then
             host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_HOST_UUID="$host_uuid"
             log_success "Хост Reality Vision создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443 -> 127.0.0.1:${vision_port})"
@@ -2622,6 +3178,7 @@ automate_remnawave_api() {
             --arg path "$xhttp_path" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$xhttp_inbound_uuid" \
+            --arg n_uuid "$node_uuid" \
             '{
                 remark: $remark,
                 address: $addr,
@@ -2632,13 +3189,15 @@ automate_remnawave_api() {
                 securityLayer: "DEFAULT",
                 alpn: "h2,http/1.1",
                 fingerprint: "chrome",
+                nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
                     configProfileInboundUuid: $i_uuid
                 }
             }')
 
-        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$xhttp_host_payload" 2>/dev/null); then
+        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$xhttp_host_payload" 2>/dev/null) \
+           || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq 'del(.nodes)')" 2>/dev/null); then
             xhttp_host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_XHTTP_HOST_UUID="$xhttp_host_uuid"
             log_success "Хост Reality XHTTP создан: UUID=${xhttp_host_uuid} (${xhttp_dom}:443 path=${xhttp_path} -> 127.0.0.1:${xhttp_port})"
@@ -2765,7 +3324,7 @@ setup_ufw() {
 }
 
 install_fail2ban() {
-    print_header "УСТАНОВКА И НАСТРОЙКА FAIL2BAN (SYSTEMD + UFW)"
+    print_header "УСТАНОВКА И НАСТРОЙКА FAIL2BAN (SYSTEMD + UFW + PORTSCAN)"
 
     if ! prompt_yn "Настроить и запустить службу Fail2ban? (y/n): " "y" "$CFG_INSTALL_FAIL2BAN"; then
         return 0
@@ -2807,6 +3366,13 @@ failregex = ^.*"remote_ip":"<HOST>".*"status":(400|401|403|404|405|444)\b.*$
 ignoreregex =
 EOF
 
+    cat > /etc/fail2ban/filter.d/portscan.conf << 'EOF'
+[Definition]
+failregex = ^.*\[UFW BLOCK\].*SRC=<HOST>.*$
+            ^.*PORTSCAN BLOCK:.*SRC=<HOST>.*$
+ignoreregex =
+EOF
+
     local ssh_port ssh_backend ssh_logpath_line=""
     ssh_port=$(detect_ssh_port)
     if python3 -c "import systemd.journal" >/dev/null 2>&1; then
@@ -2821,9 +3387,47 @@ EOF
         ssh_logpath_line="logpath = /var/log/auth.log"
     fi
 
+    local portscan_log="/var/log/kern.log"
+    local portscan_backend="auto"
+    local portscan_extra="logpath = /var/log/kern.log"
+    if [ ! -f "$portscan_log" ] && [ -f /var/log/messages ]; then
+        portscan_log="/var/log/messages"
+        portscan_extra="logpath = /var/log/messages"
+    elif [ ! -f "$portscan_log" ]; then
+        if [ "$ssh_backend" = "systemd" ]; then
+            portscan_backend="systemd"
+            portscan_extra="journalmatch = _TRANSPORT=kernel"
+        else
+            touch /var/log/kern.log
+            chmod 640 /var/log/kern.log
+            portscan_backend="polling"
+            portscan_extra="logpath = /var/log/kern.log"
+        fi
+    fi
+
     local f2b_banaction="iptables-multiport"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
         f2b_banaction="ufw"
+    elif command -v iptables >/dev/null 2>&1; then
+        local c_port n_port
+        c_port=$(get_saved_caddy_port)
+        n_port=$(get_saved_node_port)
+        cat > /etc/systemd/system/portscan-detect.service << PORTSCAN_EOF
+[Unit]
+Description=Portscan detection iptables rules for Fail2ban
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -N PORTSCAN 2>/dev/null || iptables -F PORTSCAN; iptables -A PORTSCAN -p tcp --syn -m limit --limit 10/min --limit-burst 20 -j RETURN; iptables -A PORTSCAN -p tcp --syn -j LOG --log-prefix "PORTSCAN BLOCK: " --log-level 4; iptables -C INPUT -p tcp --syn -m multiport ! --dports ${ssh_port},80,443,${c_port},${n_port} -j PORTSCAN 2>/dev/null || iptables -A INPUT -p tcp --syn -m multiport ! --dports ${ssh_port},80,443,${c_port},${n_port} -j PORTSCAN'
+ExecStop=/bin/sh -c 'iptables -D INPUT -p tcp --syn -m multiport ! --dports ${ssh_port},80,443,${c_port},${n_port} -j PORTSCAN 2>/dev/null || true; iptables -F PORTSCAN 2>/dev/null || true; iptables -X PORTSCAN 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+PORTSCAN_EOF
+        systemctl daemon-reload
+        systemctl enable --now portscan-detect.service >/dev/null 2>&1 || true
     fi
 
     local panel_ip_ignore
@@ -2833,7 +3437,7 @@ EOF
 [DEFAULT]
 banaction = ${f2b_banaction}
 banaction_allports = ${f2b_banaction}
-ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ${panel_ip_ignore}
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 ${panel_ip_ignore}
 bantime = 1h
 findtime = 10m
 maxretry = 5
@@ -2859,6 +3463,15 @@ logpath = ${CADDY_DIR}/logs/access.log
 maxretry = 15
 findtime = 10m
 bantime = 1h
+
+[portscan]
+enabled = true
+filter = portscan
+backend = ${portscan_backend}
+${portscan_extra}
+maxretry = 5
+findtime = 10m
+bantime = 24h
 EOF
 
     systemctl daemon-reload
@@ -2880,11 +3493,548 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  Установка NetBird VPN, Стека Мониторинга и Генератор Защиты (Protect)
+# ═══════════════════════════════════════════════════════════════════
+connect_netbird() {
+    local setup_key=""
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_NETBIRD_SETUP_KEY" ]; then
+        setup_key="$CFG_NETBIRD_SETUP_KEY"
+    else
+        while [ -z "$setup_key" ]; do
+            read -p "  ${ORANGE}>${NC} Введите Setup Key для NetBird: " -r setup_key
+            if [ -z "$setup_key" ]; then
+                log_error "Setup Key не может быть пустым."
+            elif ! validate_setup_key "$setup_key"; then
+                setup_key=""
+            fi
+        done
+    fi
+
+    log_info "Подключение к сети NetBird..."
+    if netbird up --setup-key "$setup_key"; then
+        log_success "NetBird подключен!"
+        local nb_ip=""
+        for _ in $(seq 1 15); do
+            nb_ip=$(ip -4 addr show wt0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+            [ -n "$nb_ip" ] && break
+            sleep 1
+        done
+        if [ -n "$nb_ip" ]; then
+            DETAIL_NETBIRD_IP="$nb_ip"
+            log_info "Внутренний IP в сети NetBird (wt0): ${ORANGE}${nb_ip}${NC}"
+        fi
+        STATUS_NETBIRD="подключен"
+        return 0
+    else
+        log_error "Ошибка подключения NetBird. Проверьте правильность Setup Key."
+        STATUS_NETBIRD="ошибка"
+        return 1
+    fi
+}
+
+install_netbird() {
+    print_header "УСТАНОВКА NETBIRD MESH VPN"
+
+    local nb_status=0
+    check_existing_netbird || nb_status=$?
+    if [ $nb_status -eq 0 ]; then
+        log_info "NetBird уже установлен и подключен (${DETAIL_NETBIRD_IP:-wt0})."
+        if ! prompt_yn "Переподключить с новым Setup Key? (y/n): " "n" "$CFG_INSTALL_NETBIRD"; then
+            STATUS_NETBIRD="уже подключен"
+            return 0
+        fi
+        connect_netbird
+        return $?
+    elif [ $nb_status -eq 2 ]; then
+        log_info "NetBird установлен, но не подключен."
+        if prompt_yn "Подключить NetBird по Setup Key? (y/n): " "y" "$CFG_INSTALL_NETBIRD"; then
+            connect_netbird
+            return $?
+        fi
+        return 0
+    fi
+
+    if ! prompt_yn "Установить и подключить NetBird VPN? (y/n): " "n" "$CFG_INSTALL_NETBIRD"; then
+        return 0
+    fi
+
+    log_info "Скачивание официального установщика NetBird..."
+    local nb_script
+    nb_script=$(create_temp_file)
+    if ! curl -fsSL https://pkgs.netbird.io/install.sh -o "$nb_script" || [ ! -s "$nb_script" ]; then
+        log_error "Не удалось скачать скрипт установки NetBird."
+        STATUS_NETBIRD="ошибка"
+        return 1
+    fi
+
+    if sh "$nb_script"; then
+        log_success "Клиент NetBird установлен."
+        connect_netbird
+    else
+        log_error "Ошибка при установке NetBird."
+        STATUS_NETBIRD="ошибка"
+        return 1
+    fi
+}
+
+install_monitoring() {
+    print_header "УСТАНОВКА МОНИТОРИНГА (CADVISOR + NODE EXPORTER + VMAGENT)"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_warning "Для стека мониторинга требуется Docker Engine."
+        return 1
+    fi
+
+    local mon_status=0
+    check_existing_monitoring || mon_status=$?
+    if [ $mon_status -eq 0 ]; then
+        log_info "Стек мониторинга уже запущен в ${MONITORING_DIR}."
+        if ! prompt_yn "Переустановить и перезаписать конфигурацию мониторинга? (y/n): " "n" "$CFG_INSTALL_MONITORING"; then
+            STATUS_MONITORING="уже установлен"
+            return 0
+        fi
+        docker compose --project-directory "$MONITORING_DIR" down 2>/dev/null || true
+    else
+        if ! prompt_yn "Установить стек мониторинга (cAdvisor + Node Exporter + vmagent)? (y/n): " "n" "$CFG_INSTALL_MONITORING"; then
+            return 0
+        fi
+    fi
+
+    update_component_versions
+
+    local instance_name="" grafana_ip=""
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_INSTANCE_NAME" ]; then
+        instance_name="$CFG_INSTANCE_NAME"
+    else
+        while [ -z "$instance_name" ]; do
+            read -p "  ${ORANGE}>${NC} Имя ноды для меток в Grafana [${NODE_NAME:-$(hostname)}]: " -r instance_name
+            instance_name="${instance_name:-${NODE_NAME:-$(hostname)}}"
+            if ! validate_instance_name "$instance_name"; then
+                instance_name=""
+            fi
+        done
+    fi
+
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_GRAFANA_IP" ]; then
+        grafana_ip="$CFG_GRAFANA_IP"
+    else
+        while [ -z "$grafana_ip" ]; do
+            read -p "  ${ORANGE}>${NC} IP сервера Grafana / VictoriaMetrics (например 100.64.0.1): " -r grafana_ip
+            if ! validate_ip "$grafana_ip"; then
+                log_error "Введите корректный IPv4-адрес."
+                grafana_ip=""
+            fi
+        done
+    fi
+
+    mkdir -p "$MONITORING_DIR/vmagent_data"
+
+    cat > "$MONITORING_DIR/prometheus.yml" << EOF
+global:
+  scrape_interval: 15s
+  external_labels:
+    instance: '${instance_name}'
+
+scrape_configs:
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['127.0.0.1:9101']
+
+  - job_name: 'vmagent'
+    static_configs:
+      - targets: ['127.0.0.1:8429']
+EOF
+
+    cat > "$MONITORING_DIR/docker-compose.yml" << EOF
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v${CADVISOR_VERSION}
+    container_name: cadvisor
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - '--port=9101'
+      - '--listen_ip=127.0.0.1'
+      - '--docker_only=true'
+      - '--housekeeping_interval=15s'
+      - '--disable_metrics=percpu,sched,tcp,udp,disk,diskIO,hugetlb,referenced_memory,cpu_topology,resctrl,process,advtcp,memory_numa'
+      - '--store_container_labels=false'
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  node-exporter:
+    image: prom/node-exporter:v${NODE_EXPORTER_VERSION}
+    container_name: node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--web.listen-address=127.0.0.1:9100'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  vmagent:
+    image: victoriametrics/vmagent:v${VMAGENT_VERSION}
+    container_name: vmagent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./vmagent_data:/vmagent_data
+    command:
+      - '--promscrape.config=/etc/prometheus/prometheus.yml'
+      - '--remoteWrite.url=http://${grafana_ip}:8428/api/v1/write'
+      - '--remoteWrite.tmpDataPath=/vmagent_data'
+      - '--remoteWrite.maxDiskUsagePerURL=1073741824'
+      - '--httpListenAddr=127.0.0.1:8429'
+      - '--memory.allowedPercent=40'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+    if docker compose --project-directory "$MONITORING_DIR" up -d --remove-orphans; then
+        sleep 2
+        if is_container_running "cadvisor" && is_container_running "node-exporter" && is_container_running "vmagent"; then
+            STATUS_MONITORING="установлен"
+            DETAIL_GRAFANA_IP="$grafana_ip"
+            _log_fix "Monitoring stack deployed (instance=${instance_name}, remoteWrite=${grafana_ip}:8428)"
+            log_success "Мониторинг запущен! Метрики отправляются на http://${grafana_ip}:8428/api/v1/write"
+        else
+            STATUS_MONITORING="ошибка"
+            log_error "Не все контейнеры мониторинга запустились. Проверьте: docker compose --project-directory $MONITORING_DIR ps"
+            return 1
+        fi
+    else
+        STATUS_MONITORING="ошибка"
+        log_error "Ошибка при запуске контейнеров мониторинга."
+        return 1
+    fi
+}
+
+run_verify_stack() {
+    _init_env
+    print_header "E2E ВЕРИФИКАЦИЯ СТЕКА: CADDY L4 ──► XRAY REALITY ──► SELFSTEAL"
+
+    local v_dom x_dom c_port v_port x_port
+    v_dom=$(get_saved_caddy_domain)
+    x_dom=$(get_saved_xhttp_domain)
+    c_port=$(get_saved_caddy_port)
+    v_port="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
+    x_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
+
+    local xray_ver="не запущен" caddy_ver="не запущен"
+    if is_container_running "remnanode"; then
+        xray_ver=$(docker exec remnanode xray version 2>/dev/null | head -1 | awk '{print $1, $2}' || echo "running")
+    fi
+    if is_container_running "$CADDY_CONTAINER_NAME"; then
+        caddy_ver=$(docker exec "$CADDY_CONTAINER_NAME" caddy version 2>/dev/null | head -1 || echo "running")
+    fi
+
+    box_top "1/3 · ВЕРСИИ ЯДРА И L4 СОКЕТЫ"
+    box_kv "Ядро Xray (remnanode)" "${xray_ver}"
+    box_kv "Сервер Caddy L4" "${caddy_ver}"
+
+    local ss_out
+    ss_out=$(ss -tlnp 2>/dev/null || true)
+    if echo "$ss_out" | grep -qE ':443[[:space:]]'; then
+        box_row "${GREEN}${BOLD}[ PASS ]${NC} Внешний сокет :443/tcp (Caddy L4 SNI Router) активен"
+    else
+        box_row "${RED}${BOLD}[ FAIL ]${NC} Порт :443/tcp НЕ слушается! Проверьте контейнер ${CADDY_CONTAINER_NAME}"
+    fi
+    if echo "$ss_out" | grep -qE "127\.0\.0\.1:${v_port}[[:space:]]"; then
+        box_row "${GREEN}${BOLD}[ PASS ]${NC} Инбаунд VLESS Reality Vision слушает 127.0.0.1:${v_port}"
+    else
+        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Сокет 127.0.0.1:${v_port} (Vision) не обнаружен (ожидание конфига от панели)"
+    fi
+    if echo "$ss_out" | grep -qE "127\.0\.0\.1:${x_port}[[:space:]]"; then
+        box_row "${GREEN}${BOLD}[ PASS ]${NC} Инбаунд VLESS Reality XHTTP слушает 127.0.0.1:${x_port}"
+    else
+        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Сокет 127.0.0.1:${x_port} (XHTTP) не обнаружен (ожидание конфига от панели)"
+    fi
+    if echo "$ss_out" | grep -qE "127\.0\.0\.1:${c_port}[[:space:]]"; then
+        box_row "${GREEN}${BOLD}[ PASS ]${NC} Внутренний Selfsteal слушает строго 127.0.0.1:${c_port}"
+    else
+        box_row "${RED}${BOLD}[ FAIL ]${NC} Сокет Selfsteal 127.0.0.1:${c_port} не активен"
+    fi
+    box_bottom
+    echo
+
+    box_top "2/3 · СКВОЗНОЙ ТЕСТ РУКОПОЖАТИЙ И МАСКИРОВКИ (E2E PROBE)"
+    if [ -n "$v_dom" ]; then
+        local v_probe=""
+        v_probe=$(curl -sS -I --http2 --tlsv1.3 --connect-timeout 5 --max-time 8 \
+            --resolve "${v_dom}:443:127.0.0.1" "https://${v_dom}/" 2>/dev/null | head -1 | tr -d '\r' || true)
+        if echo "$v_probe" | grep -qE "HTTP/(2|1\.1) 200"; then
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} Vision E2E (${v_dom}:443 -> :${v_port} -> :${c_port}): ${v_probe}"
+        else
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} Vision E2E (${v_dom}:443): ${v_probe:-нет ответа HTTP 200}"
+        fi
+    else
+        box_row "${YELLOW}${BOLD}[ SKIP ]${NC} SELF_STEAL_DOMAIN ещё не настроен"
+    fi
+
+    if [ -n "$x_dom" ]; then
+        local x_probe=""
+        x_probe=$(curl -sS -I --http2 --tlsv1.3 --connect-timeout 5 --max-time 8 \
+            --resolve "${x_dom}:443:127.0.0.1" "https://${x_dom}/" 2>/dev/null | head -1 | tr -d '\r' || true)
+        if echo "$x_probe" | grep -qE "HTTP/(2|1\.1) 200"; then
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} XHTTP E2E  (${x_dom}:443 -> :${x_port} -> :${c_port}): ${x_probe}"
+        else
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} XHTTP E2E  (${x_dom}:443): ${x_probe:-нет ответа HTTP 200}"
+        fi
+    else
+        box_row "${YELLOW}${BOLD}[ SKIP ]${NC} XHTTP_STEAL_DOMAIN ещё не настроен"
+    fi
+
+    local scan_probe=""
+    scan_probe=$(curl -k -sS -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 \
+        --resolve "scanner-probe.invalid:443:127.0.0.1" "https://scanner-probe.invalid/" 2>/dev/null || echo "000")
+    if [ "$scan_probe" = "204" ] || [ "$scan_probe" = "000" ]; then
+        box_row "${GREEN}${BOLD}[ PASS ]${NC} Защита от сканеров (чужой SNI -> catch-all): HTTP ${scan_probe} (реальный домен скрыт)"
+    else
+        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Защита от сканеров (чужой SNI): вернул HTTP ${scan_probe}"
+    fi
+    box_bottom
+    echo
+
+    box_top "3/3 · ПРОВЕРКА DNS И ОТСУТСТВИЯ CLOUDFLARE ПРОКСИ (ORANGE CLOUD)"
+    for dom in "$v_dom" "$x_dom"; do
+        [ -z "$dom" ] && continue
+        local r_ip=""
+        r_ip=$(resolve_host_to_ip "$dom")
+        if [ "$r_ip" = "$NODE_IP" ]; then
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS ${dom} -> ${r_ip} (DNS-only, указывает прямо на ноду)"
+        elif [ -n "$r_ip" ]; then
+            box_row "${RED}${BOLD}[ FAIL ]${NC} DNS ${dom} -> ${r_ip} (НЕ совпадает с IP ноды ${NODE_IP}! Отключите прокси Cloudflare)"
+        else
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS ${dom}: A-запись не найдена"
+        fi
+    done
+    box_bottom
+    echo
+}
+
+run_protect() {
+    _init_env
+    print_header "ГЕНЕРАТОР ЗАЩИТНЫХ КОНФИГОВ (NFTABLES ANTI-DDOS + SSH HARDENING)"
+
+    mkdir -p "$PROTECT_OUT_DIR"
+    local ssh_port node_port panel_ip
+    ssh_port=$(detect_ssh_port)
+    node_port=$(get_saved_node_port)
+    panel_ip=$(get_saved_panel_ip)
+
+    local ssh_keys_ok=0
+    local ak
+    for ak in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [ -f "$ak" ] || continue
+        if grep -qE '^(ssh-(rsa|ed25519|ecdsa)|ecdsa-sha2-)' "$ak" 2>/dev/null; then
+            ssh_keys_ok=1
+            break
+        fi
+    done
+
+    local panel_rule="# Panel API port ${node_port}/tcp (uncomment and set panel IP if needed)
+        # ip saddr 127.0.0.1 tcp dport ${node_port} accept"
+    if [ -n "$panel_ip" ]; then
+        panel_rule="# Remnawave Panel ACL (${panel_ip} -> ${node_port}/tcp)
+        ip saddr ${panel_ip} tcp dport ${node_port} accept"
+    fi
+
+    cat > "${PROTECT_OUT_DIR}/firewall.nft" << EOF
+#!/usr/sbin/nft -f
+# Generated by node-mgr v${SCRIPT_VERSION} (protect module)
+# Dedicated table 'inet vpn_protect' — safe alongside Docker iptables rules.
+
+table inet vpn_protect
+delete table inet vpn_protect
+
+table inet vpn_protect {
+    set ipv4_Allowlist {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10${panel_ip:+, ${panel_ip}} }
+    }
+
+    set ssh_meter4 {
+        type ipv4_addr
+        size 65535
+        flags dynamic, timeout
+        timeout 10m
+    }
+
+    set syn_443_meter4 {
+        type ipv4_addr
+        size 131072
+        flags dynamic, timeout
+        timeout 1m
+    }
+
+    set udp_443_meter4 {
+        type ipv4_addr
+        size 131072
+        flags dynamic, timeout
+        timeout 1m
+    }
+
+    chain input {
+        type filter hook input priority filter - 5; policy accept;
+
+        iif "lo" accept
+        iifname "wt0" accept
+        iifname "docker*" accept
+        iifname "br-*" accept
+
+        ct state vmap { established : accept, related : accept, invalid : drop }
+
+        ip saddr @ipv4_Allowlist accept
+
+        # ICMP rate-limited
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
+        ip6 nexthdr icmpv6 limit rate 20/second accept
+
+        # SSH brute-force protection (port ${ssh_port})
+        tcp dport ${ssh_port} ct state new add @ssh_meter4 { ip saddr limit rate 6/minute burst 10 packets } accept
+        tcp dport ${ssh_port} ct state new drop
+
+        ${panel_rule}
+        tcp dport ${node_port} drop
+
+        # HTTP ACME port 80
+        tcp dport 80 accept
+
+        # VLESS Reality / XHTTP port 443/tcp per-IP new connection limit (anti-SYN flood)
+        tcp dport 443 ct state new add @syn_443_meter4 { ip saddr limit rate 60/second burst 120 packets } accept
+        tcp dport 443 ct state new drop
+
+        # QUIC / Hysteria2 / UDP 443 per-IP rate limit
+        udp dport 443 ct state new add @udp_443_meter4 { ip saddr limit rate 120/second burst 200 packets } accept
+        udp dport 443 ct state new drop
+    }
+}
+EOF
+    chmod 644 "${PROTECT_OUT_DIR}/firewall.nft"
+
+    local pwd_auth="no"
+    local pwd_comment="# SSH-ключи обнаружены — парольный вход безопасно отключён"
+    if [ "$ssh_keys_ok" -eq 0 ]; then
+        pwd_auth="yes"
+        pwd_comment="# ВНИМАНИЕ: SSH-ключи не найдены в authorized_keys! PasswordAuthentication оставлен 'yes' во избежание потери доступа."
+    fi
+
+    cat > "${PROTECT_OUT_DIR}/sshd-hardening.conf" << EOF
+# Generated by node-mgr v${SCRIPT_VERSION} (protect module)
+# Copy to /etc/ssh/sshd_config.d/99-vpn-hardening.conf and test with 'sshd -t'
+${pwd_comment}
+Port ${ssh_port}
+PasswordAuthentication ${pwd_auth}
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin prohibit-password
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 20
+ClientAliveInterval 60
+ClientAliveCountMax 3
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+EOF
+
+    cat > "${PROTECT_OUT_DIR}/APPLY.txt" << EOF
+====================================================================
+ ИНСТРУКЦИЯ ПО БЕЗОПАСНОМУ ПРИМЕНЕНИЮ ЗАЩИТЫ (AUTO-ROLLBACK 5 МИН)
+====================================================================
+
+1. Проверка синтаксиса nftables:
+   nft -c -f ${PROTECT_OUT_DIR}/firewall.nft
+
+2. Безопасное тестовое применение с авто-откатом через 5 минут
+   (если вы потеряете доступ, таймер удалит таблицу автоматически):
+   systemd-run --on-active=300 --unit=nft-rollback /usr/sbin/nft delete table inet vpn_protect
+   nft -f ${PROTECT_OUT_DIR}/firewall.nft
+
+3. Если SSH и VPN работают штатно — отмените таймер авто-отката:
+   systemctl stop nft-rollback.timer nft-rollback.service 2>/dev/null || true
+
+4. Применение SSH Hardening:
+   cp ${PROTECT_OUT_DIR}/sshd-hardening.conf /etc/ssh/sshd_config.d/99-vpn-hardening.conf
+   sshd -t && systemctl reload sshd
+====================================================================
+EOF
+
+    box_top "СГЕНЕРИРОВАННЫЕ ФАЙЛЫ ЗАЩИТЫ (${PROTECT_OUT_DIR})"
+    box_kv "Таблица nftables" "${PROTECT_OUT_DIR}/firewall.nft"
+    box_kv "SSH Hardening" "${PROTECT_OUT_DIR}/sshd-hardening.conf"
+    box_kv "Инструкция + таймер" "${PROTECT_OUT_DIR}/APPLY.txt"
+    if [ "$ssh_keys_ok" -eq 1 ]; then
+        box_row "${GREEN}${BOLD}[ OK ]${NC} SSH authorized_keys найдены — PasswordAuthentication no"
+    else
+        box_row "${YELLOW}${BOLD}[WARN]${NC} SSH authorized_keys НЕ найдены — PasswordAuthentication оставлен yes"
+    fi
+    box_bottom
+    echo
+    log_success "Файлы защиты сохранены в ${PROTECT_OUT_DIR} (система не изменена, см. APPLY.txt)"
+}
+
+dry_run() {
+    _init_env
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config_file "$CONFIG_FILE"
+    fi
+    print_header "РЕЖИМ ПРОВЕРКИ ПЛАНА РАЗВЕРТЫВАНИЯ (--DRY-RUN)"
+    box_top "ПЛАН КОНФИГУРАЦИИ И МОДУЛЕЙ (БЕЗ ВНЕСЕНИЯ ИЗМЕНЕНИЙ)"
+    box_kv "ОС / Ядро" "${OS} ($(uname -r)) | Пакетный менеджер: ${PKG_MANAGER}"
+    box_kv "IP узла / SSH порт" "${NODE_ADDRESS:-$NODE_IP} | SSH: $(detect_ssh_port)/tcp"
+    box_kv "Remnawave API URL" "${REMNAWAVE_API_URL:-не задан (интерактивный запрос)}"
+    box_kv "Vision SNI (:10443)" "${SELF_STEAL_DOMAIN:-$(get_saved_caddy_domain)} -> Selfsteal 127.0.0.1:${SELF_STEAL_PORT}"
+    box_kv "XHTTP SNI (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-$DEFAULT_XHTTP_PATH})"
+    box_kv "Метод выпуска SSL" "$([ "${CFG_CERT_TYPE:-1}" = "2" ] && echo "Cloudflare DNS-01" || echo "Let's Encrypt HTTP-01 (:80)")"
+    box_kv "Порт API Ноды" "${CFG_NODE_PORT:-$(get_saved_node_port)}/tcp (ACL для панели: ${CFG_PANEL_IP:-$(get_saved_panel_ip)})"
+    box_kv "Сетевой стек Highload" "BBR + sch_cake/fq + 64MB buffers + RPS/XPS + NIC + TCPMSS + FD 1M"
+    box_kv "UFW + Fail2ban" "UFW=${CFG_SETUP_UFW:-y} | Fail2ban=${CFG_INSTALL_FAIL2BAN:-y} (sshd, caddy-status, portscan)"
+    box_kv "NetBird / Мониторинг" "NetBird=${CFG_INSTALL_NETBIRD:-n} | Monitoring=${CFG_INSTALL_MONITORING:-n} (${CFG_GRAFANA_IP:-нет IP})"
+    box_bottom
+    echo
+    log_success "Dry-run завершён. Никакие изменения в систему не вносились."
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  Сценарии развертывания: API Auto-Deploy и Интерактивная установка
 # ═══════════════════════════════════════════════════════════════════
 run_api_auto_deploy() {
     _init_env
-    print_header "АВТОМАТИЧЕСКОЕ РАЗВЕРТЫВАНИЕ ЧЕРЕЗ REMNAWAVE API [1/7 .. 7/7]"
+    print_header "АВТОМАТИЧЕСКОЕ РАЗВЕРТЫВАНИЕ ЧЕРЕЗ REMNAWAVE API [1/8 .. 8/8]"
 
     if ! check_disk_space 500 "/opt"; then
         if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
@@ -2893,14 +4043,14 @@ run_api_auto_deploy() {
     ensure_package_manager_available
     _RESTORE_AUTO_UPDATES=true
 
-    echo -e "\n  ${ORANGE}${BOLD}[1/7] Проверка утилит (curl, jq, openssl, ethtool) и сбор параметров API${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[1/8] Проверка утилит (curl, jq, openssl, ethtool) и сбор параметров API${NC}"
     install_base_utilities
     collect_api_inputs
 
-    echo -e "\n  ${ORANGE}${BOLD}[2/7] Highload-оптимизация ядра, RPS, NIC и лимитов${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[2/8] Highload-оптимизация ядра, RPS/XPS, NIC и лимитов${NC}"
     run_optimize "--all"
 
-    echo -e "\n  ${ORANGE}${BOLD}[3/7] Проверка и установка Docker Engine & Compose v2${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[3/8] Проверка и установка Docker Engine & Compose v2${NC}"
     if install_docker && check_docker_compose; then
         STATUS_DOCKER="установлен"
     else
@@ -2908,16 +4058,24 @@ run_api_auto_deploy() {
         exit 1
     fi
 
-    echo -e "\n  ${ORANGE}${BOLD}[4/7] Развертывание Caddy Selfsteal (/opt/selfsteel) и выпуск SSL${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[4/8] Развертывание Caddy L4 Selfsteal (/opt/selfsteel) и выпуск SSL${NC}"
     install_caddy_selfsteal
 
-    echo -e "\n  ${ORANGE}${BOLD}[5/7] Автоматическое создание Профиля, Ноды и Хоста через Remnawave API${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[5/8] Автоматическое создание Профиля, Ноды и 2 Хостов через Remnawave API${NC}"
     automate_remnawave_api
 
-    echo -e "\n  ${ORANGE}${BOLD}[6/7] Развертывание Remnanode (/opt/remnanode) с пробросом /certs:ro${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[6/8] Развертывание Remnanode (/opt/remnanode) с пробросом /certs:ro${NC}"
     deploy_remnanode_container "$CFG_NODE_PORT" "$CFG_SECRET_KEY" "$CFG_PANEL_IP"
 
-    echo -e "\n  ${ORANGE}${BOLD}[7/7] Изоляция периметра UFW и запуск Fail2ban${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[7/8] Опциональные модули: NetBird Mesh VPN и Стек Мониторинга${NC}"
+    if [[ "${CFG_INSTALL_NETBIRD:-n}" =~ ^[Yy]$ ]]; then
+        install_netbird || true
+    fi
+    if [[ "${CFG_INSTALL_MONITORING:-n}" =~ ^[Yy]$ ]]; then
+        install_monitoring || true
+    fi
+
+    echo -e "\n  ${ORANGE}${BOLD}[8/8] Изоляция периметра UFW и запуск Fail2ban${NC}"
     setup_ufw
     install_fail2ban
 
@@ -2934,8 +4092,8 @@ run_full_install() {
     fi
 
     print_header "ВЫБОР РЕЖИМА ПОЛНОЙ УСТАНОВКИ УЗЛА"
-    echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Автоматическая регистрация через Remnawave API${NC} ${DIM}(Нода + Профиль xhttp + Хост + Selfsteal)${NC}"
-    echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Ручная установка по готовому SECRET_KEY${NC}       ${DIM}(Классический режим)${NC}"
+    echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Автоматическая регистрация через Remnawave API${NC} ${DIM}(Caddy L4 + Reality Vision + XHTTP + 2 Хоста)${NC}"
+    echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Ручная установка по готовому SECRET_KEY${NC}       ${DIM}(Классический режим + опции NetBird/Monitoring)${NC}"
     echo
     local mode_c="1"
     prompt_choice "Выберите режим [1-2, Enter=1]: " 2 mode_c "1"
@@ -2945,7 +4103,7 @@ run_full_install() {
         return 0
     fi
 
-    print_header "КЛАССИЧЕСКАЯ УСТАНОВКА УЗЛА [1/6 .. 6/6]"
+    print_header "КЛАССИЧЕСКАЯ УСТАНОВКА УЗЛА [1/8 .. 8/8]"
     if ! check_disk_space 500 "/opt"; then
         if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
     fi
@@ -2953,10 +4111,10 @@ run_full_install() {
     _RESTORE_AUTO_UPDATES=true
     install_base_utilities
 
-    echo -e "\n  ${ORANGE}${BOLD}[1/6] Оптимизация ядра, RPS, NIC и лимитов${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[1/8] Оптимизация ядра, RPS/XPS, NIC и лимитов${NC}"
     run_optimize "--all"
 
-    echo -e "\n  ${ORANGE}${BOLD}[2/6] Установка Docker Engine${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[2/8] Установка Docker Engine${NC}"
     if install_docker && check_docker_compose; then
         STATUS_DOCKER="установлен"
     else
@@ -2964,16 +4122,22 @@ run_full_install() {
         exit 1
     fi
 
-    echo -e "\n  ${ORANGE}${BOLD}[3/6] Установка Caddy Selfsteal (/opt/selfsteel)${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[3/8] Установка Caddy Selfsteal (/opt/selfsteel)${NC}"
     install_caddy_selfsteal
 
-    echo -e "\n  ${ORANGE}${BOLD}[4/6] Установка RemnawaveNode (/opt/remnanode)${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[4/8] Установка RemnawaveNode (/opt/remnanode)${NC}"
     install_remnanode_manual
 
-    echo -e "\n  ${ORANGE}${BOLD}[5/6] Настройка UFW Firewall (Strict Panel ACL)${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[5/8] Установка NetBird Mesh VPN (опционально)${NC}"
+    install_netbird || true
+
+    echo -e "\n  ${ORANGE}${BOLD}[6/8] Установка стека мониторинга Grafana/vmagent (опционально)${NC}"
+    install_monitoring || true
+
+    echo -e "\n  ${ORANGE}${BOLD}[7/8] Настройка UFW Firewall (Strict Panel ACL)${NC}"
     setup_ufw
 
-    echo -e "\n  ${ORANGE}${BOLD}[6/6] Установка и запуск Fail2ban${NC}"
+    echo -e "\n  ${ORANGE}${BOLD}[8/8] Установка и запуск Fail2ban${NC}"
     install_fail2ban
 
     restore_auto_updates
@@ -2984,17 +4148,21 @@ run_full_install() {
 run_selective_install() {
     _init_env
     print_header "ВЫБОРОЧНАЯ УСТАНОВКА / ПОЧИНКА МОДУЛЕЙ"
-    echo -e "    ${ORANGE}${BOLD}[1]${NC} Оптимизация ядра (sysctl/BBR/FD/RPS/NIC/MSS/journald)"
+    echo -e "    ${ORANGE}${BOLD}[1]${NC} Оптимизация ядра (sysctl/BBR/sch_cake/FD/RPS+XPS/NIC/MSS/journald)"
     echo -e "    ${ORANGE}${BOLD}[2]${NC} Docker Engine & Compose v2"
-    echo -e "    ${ORANGE}${BOLD}[3]${NC} Caddy Selfsteal (/opt/selfsteel + /opt/html)"
+    echo -e "    ${ORANGE}${BOLD}[3]${NC} Caddy L4 Selfsteal (/opt/selfsteel + /opt/html, HTTP-01 или Cloudflare DNS-01)"
     echo -e "    ${ORANGE}${BOLD}[4]${NC} Регистрация через Remnawave API + запуск Remnanode"
     echo -e "    ${ORANGE}${BOLD}[5]${NC} Ручная установка Remnanode (по SECRET_KEY)"
     echo -e "    ${ORANGE}${BOLD}[6]${NC} UFW Firewall (доступ к порту ноды только с IP панели)"
-    echo -e "    ${ORANGE}${BOLD}[7]${NC} Fail2ban (починка конфига и перезапуск)"
+    echo -e "    ${ORANGE}${BOLD}[7]${NC} Fail2ban (sshd + caddy-status + portscan)"
+    echo -e "    ${ORANGE}${BOLD}[8]${NC} NetBird Mesh VPN (установка и подключение по Setup Key)"
+    echo -e "    ${ORANGE}${BOLD}[9]${NC} Стек мониторинга (cAdvisor + Node Exporter + vmagent)"
+    echo -e "    ${ORANGE}${BOLD}[10]${NC} Генератор защитных профилей (nftables + sshd hardening в ${PROTECT_OUT_DIR})"
+    echo -e "    ${ORANGE}${BOLD}[11]${NC} Smart Traffic Shaper (CAKE dual-srchost для честного деления канала)"
     echo
 
     local selection_raw
-    read -p "  ${ORANGE}>${NC} Номера через пробел [1-7]: " -r selection_raw
+    read -p "  ${ORANGE}>${NC} Номера через пробел [1-11]: " -r selection_raw
     if [ -z "$selection_raw" ]; then return 0; fi
 
     ensure_package_manager_available
@@ -3010,6 +4178,10 @@ run_selective_install() {
             5) install_remnanode_manual ;;
             6) setup_ufw ;;
             7) install_fail2ban ;;
+            8) install_netbird ;;
+            9) install_monitoring ;;
+            10) run_protect ;;
+            11) opt_shaper ;;
         esac
     done
 
@@ -3034,11 +4206,14 @@ show_logs() {
                 docker logs -f --tail=100 caddy-selfsteal
             fi
             ;;
+        monitoring|vmagent|cadvisor)
+            docker compose --project-directory "$MONITORING_DIR" logs -f --tail=100
+            ;;
         f2b|fail2ban)
             journalctl -u fail2ban -n 100 -f
             ;;
         *)
-            log_error "Использование: node-mgr logs {node|caddy|f2b}"
+            log_error "Использование: node-mgr logs {node|caddy|monitoring|f2b}"
             ;;
     esac
 }
@@ -3070,6 +4245,7 @@ self_update() {
 show_status() {
     _init_env
     print_banner
+    print_live_statusbar
     echo
     local cc qdisc rmem_mb ssh_p panel_ip node_p caddy_p caddy_dom xhttp_dom
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
@@ -3081,6 +4257,8 @@ show_status() {
     caddy_p=$(get_saved_caddy_port)
     caddy_dom=$(get_saved_caddy_domain)
     xhttp_dom=$(get_saved_xhttp_domain)
+    check_existing_netbird || true
+    check_existing_monitoring || true
 
     box_top "СОСТОЯНИЕ УЗЛА И СЕТЕВОГО СТЕКА"
     box_kv "ОС / Ядро" "${OS} ($(uname -r))"
@@ -3089,6 +4267,8 @@ show_status() {
     box_kv "IP Панели (UFW ACL)" "${panel_ip:-не привязан} -> порт ${node_p}/tcp"
     box_kv "Vision SNI (:10443)" "${caddy_dom:-не настроен} (Selfsteal 127.0.0.1:${caddy_p})"
     box_kv "XHTTP SNI (:10444)" "${xhttp_dom:-не настроен} (path: ${XHTTP_PATH:-$DEFAULT_XHTTP_PATH})"
+    box_kv "NetBird IP (wt0)" "${DETAIL_NETBIRD_IP:-не подключен}"
+    box_kv "Мониторинг Grafana" "${DETAIL_GRAFANA_IP:+http://${DETAIL_GRAFANA_IP}:8428}${DETAIL_GRAFANA_IP:-не настроен}"
     box_bottom
     echo
 
@@ -3109,6 +4289,22 @@ show_status() {
         box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${CADDY_CONTAINER_NAME} (L4 :443 | Selfsteal 127.0.0.1:${caddy_p})"
     else
         box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер ${CADDY_CONTAINER_NAME}"
+    fi
+
+    if is_container_running "vmagent" && is_container_running "node-exporter" && is_container_running "cadvisor"; then
+        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Мониторинг (cAdvisor + node-exporter + vmagent -> ${DETAIL_GRAFANA_IP:-remoteWrite})"
+    elif [ -d "$MONITORING_DIR" ]; then
+        box_row "${YELLOW}${BOLD}[ PARTIAL ]${NC} Мониторинг (${MONITORING_DIR})"
+    else
+        box_row "${GRAPHITE}[ NOT SET ]${NC} Мониторинг (cAdvisor + node-exporter + vmagent)"
+    fi
+
+    if [ -n "$DETAIL_NETBIRD_IP" ]; then
+        box_row "${GREEN}${BOLD}[ ONLINE  ]${NC} NetBird VPN (wt0: ${DETAIL_NETBIRD_IP})"
+    elif command -v netbird >/dev/null 2>&1; then
+        box_row "${YELLOW}${BOLD}[ OFFLINE ]${NC} NetBird VPN (установлен, не подключен)"
+    else
+        box_row "${GRAPHITE}[ NOT SET ]${NC} NetBird VPN"
     fi
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
@@ -3137,6 +4333,8 @@ show_installation_summary() {
     box_kv "L4 Маршрутизация :443" "Vision -> 127.0.0.1:${VISION_INBOUND_PORT} | XHTTP -> 127.0.0.1:${XHTTP_INBOUND_PORT}"
     box_kv "Remnawave API" "$STATUS_API ${DETAIL_NODE_UUID:+(Node UUID: $DETAIL_NODE_UUID)}"
     box_kv "RemnawaveNode" "$STATUS_REMNANODE (порт: $(get_saved_node_port), /certs:ro)"
+    box_kv "NetBird VPN" "${STATUS_NETBIRD}${DETAIL_NETBIRD_IP:+ (IP: $DETAIL_NETBIRD_IP)}"
+    box_kv "Стек Мониторинга" "${STATUS_MONITORING}${DETAIL_GRAFANA_IP:+ (-> $DETAIL_GRAFANA_IP:8428)}"
     box_kv "UFW Firewall (ACL)" "$STATUS_UFW (панель: $(get_saved_panel_ip))"
     box_kv "Fail2ban" "$STATUS_FAIL2BAN"
     box_bottom
@@ -3156,6 +4354,19 @@ update_components() {
         docker compose --project-directory "$CADDY_DIR" build --pull
         docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
     fi
+    if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
+        log_info "Обновление версий и образов стека мониторинга (cAdvisor / node-exporter / vmagent)..."
+        update_component_versions
+        sed -i -E "s|gcr.io/cadvisor/cadvisor:v[0-9.]+|gcr.io/cadvisor/cadvisor:v${CADVISOR_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
+        sed -i -E "s|prom/node-exporter:v[0-9.]+|prom/node-exporter:v${NODE_EXPORTER_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
+        sed -i -E "s|victoriametrics/vmagent:v[0-9.]+|victoriametrics/vmagent:v${VMAGENT_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
+        docker compose --project-directory "$MONITORING_DIR" pull
+        docker compose --project-directory "$MONITORING_DIR" up -d --remove-orphans
+    fi
+    if command -v netbird >/dev/null 2>&1; then
+        log_info "Проверка обновлений пакета NetBird..."
+        install_package netbird >/dev/null 2>&1 || true
+    fi
     log_success "Все установленные компоненты обновлены."
 }
 
@@ -3168,10 +4379,11 @@ export_config() {
     if [ -f "$REMNANODE_DIR/.env" ]; then
         cfg_secret=$(grep "^SECRET_KEY=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
     fi
+    check_existing_monitoring || true
 
     umask 077
     cat > "$output" << EOF
-# LissVPN Node Orchestrator Configuration
+# LissVPN Node Orchestrator Configuration (v${SCRIPT_VERSION})
 REMNAWAVE_API_URL="${REMNAWAVE_API_URL}"
 REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
@@ -3182,12 +4394,19 @@ XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}
+CFG_CERT_TYPE="${CFG_CERT_TYPE:-1}"
+CFG_CLOUDFLARE_TOKEN="${CFG_CLOUDFLARE_TOKEN}"
 CFG_SECRET_KEY="${cfg_secret}"
 CFG_NODE_PORT=$(get_saved_node_port)
 CFG_PANEL_IP="$(get_saved_panel_ip)"
 CFG_APPLY_NETWORK=y
 CFG_SETUP_UFW=y
 CFG_INSTALL_FAIL2BAN=y
+CFG_INSTALL_NETBIRD="${CFG_INSTALL_NETBIRD:-n}"
+CFG_NETBIRD_SETUP_KEY="${CFG_NETBIRD_SETUP_KEY}"
+CFG_INSTALL_MONITORING="$([ -d "$MONITORING_DIR" ] && echo "y" || echo "n")"
+CFG_INSTANCE_NAME="${CFG_INSTANCE_NAME:-$(hostname)}"
+CFG_GRAFANA_IP="${DETAIL_GRAFANA_IP:-$CFG_GRAFANA_IP}"
 EOF
     chmod 600 "$output"
     umask 022
@@ -3209,13 +4428,21 @@ uninstall_all() {
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
     fi
-    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal 2>/dev/null || true
+    if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
+        docker compose --project-directory "$MONITORING_DIR" down 2>/dev/null || true
+    fi
+    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal cadvisor node-exporter vmagent 2>/dev/null || true
+
+    if systemctl is-active --quiet portscan-detect.service 2>/dev/null; then
+        systemctl disable --now portscan-detect.service 2>/dev/null || true
+    fi
+    rm -f /etc/systemd/system/portscan-detect.service
 
     run_rollback
-    rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-status.conf
+    rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-status.conf /etc/fail2ban/filter.d/portscan.conf
     systemctl restart fail2ban 2>/dev/null || true
 
-    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" "$CADDY_HTML_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
+    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" "$CADDY_HTML_DIR" "$MONITORING_DIR" "$PROTECT_OUT_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
     log_success "Все компоненты узла удалены."
 }
 
@@ -3225,21 +4452,28 @@ show_help() {
 
   Использование: node-mgr [КОМАНДА] [ОПЦИИ]
 
-  Основные команды тулкита:
+  Основные команды тулкита (v4.0):
     auto-deploy                  Полное авто-развертывание ноды, L4-профиля (Reality+XHTTP) и 2 хостов по API
-    diagnose [-q|--no-net]       Диагностика ноды (27 чеков, дашборд, вердикт)
-    optimize [--all|--from-findings|--zram|--sysctl|--rps|--nic|--mss]
-                                 Тюнинг ядра, BBR, лимитов FD, RPS/RFS, NIC, TCPMSS, Zram
-    bbr3                         Установка ядра XanMod с поддержкой BBRv3
+    diagnose [-q|--no-net|--json] Диагностика ноды (33 чека, Score 0..100, отчёт, JSON-экспорт)
+    verify                       Сквозной E2E-тест рукопожатий (Caddy L4 :443 -> Xray Reality -> Selfsteal :9443)
+    optimize [--all|--from-findings|--zram|--shaper [MBIT]|--sysctl|--rps|--nic|--mss]
+                                 Тюнинг ядра, BBR + sch_cake/fq, FD, RPS/XPS, NIC (LRO off), TCPMSS, Zram, Shaper
+    shape [MBIT]                 Включить CAKE Traffic Shaper (dual-srchost) для защиты от перегрузки канала
+    protect                      Генерация защитных конфигов nftables (anti-DDoS) и sshd hardening
+    bbr3                         Установка ядра XanMod с поддержкой BBRv3 (с проверкой релиза и GPG)
     rollback                     Откат всех наложенных оптимизаций
-    status                       Показать состояние узла, контейнеров и артефактов
-    logs {node|caddy|f2b}        Просмотр логов RemnaNode, Caddy или Fail2ban в реальном времени
+    status                       Показать состояние узла, контейнеров, NetBird, мониторинга и артефактов
+    logs {node|caddy|monitoring|f2b}
+                                 Просмотр логов RemnaNode, Caddy, Мониторинга или Fail2ban
     install                      Установка ноды (с выбором API или ручного режима)
-    selective                    Выборочная установка или починка отдельных модулей
-    change-template              Смена HTML-шаблона маскировки (/opt/html)
-    update                       Обновление Docker-образов RemnaNode и Caddy L4
+    selective                    Выборочная установка модулей (включая NetBird, Monitoring, Protect, Shaper)
+    netbird                      Установка и подключение NetBird Mesh VPN по Setup Key
+    monitoring                   Установка стека мониторинга (cAdvisor + Node Exporter + vmagent)
+    change-template              Смена HTML-шаблона маскировки (/opt/html, 10 шаблонов)
+    update                       Обновление Docker-образов (RemnaNode, Caddy L4, Monitoring) и NetBird
     self-update                  Обновление самого скрипта node-mgr из GitHub
-    export-config [FILE]         Экспорт текущих настроек в конфиг-файл
+    export-config [FILE]         Экспорт текущих настроек в конфиг-файл (chmod 600)
+    dry-run                      Показать план развертывания без внесения изменений в систему
     uninstall                    Удаление всех компонентов и откат настроек
     --config FILE                Автоматическая установка по конфиг-файлу
 
@@ -3252,29 +4486,38 @@ show_help() {
     XHTTP_STEAL_DOMAIN="nl2.example.com"
     XHTTP_PATH="/api/v3/sync/r1"
     SELF_STEAL_PORT="9443"
+    CFG_CERT_TYPE="1"            # 1 = Let's Encrypt HTTP-01 (:80), 2 = Cloudflare DNS-01
+    CFG_CLOUDFLARE_TOKEN="..."   # API-токен Cloudflare (при CFG_CERT_TYPE=2)
 HELP
     echo
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  Интерактивное меню
+#  Интерактивное меню v4.0
 # ═══════════════════════════════════════════════════════════════════
 show_main_menu() {
     while true; do
         print_banner
+        print_live_statusbar
+        echo -e "  ${SLATE}${BOLD}ДИАГНОСТИКА И ТЮНИНГ ЯДРА${NC}"
+        echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Диагностика ноды${NC}     ${DIM}33 чека, Score 0..100, PSI, MSS, порт-аудит, JSON/отчёт${NC}"
+        echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Оптимизация стека${NC}    ${DIM}sysctl / BBR+CAKE / FD / RPS+XPS / NIC / Shaper / Zram${NC}"
+        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Тест L4 и Selfsteal${NC}  ${DIM}E2E-проверка рукопожатий :443 -> Xray -> Selfsteal :9443${NC}"
+        echo -e "    ${ORANGE}${BOLD}[4]${NC} ${WHITE}Ядро BBRv3 (XanMod)${NC}  ${DIM}установка ядра XanMod под микроархитектуру CPU${NC}"
         echo
-        echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Диагностика ноды${NC}     ${DIM}27 чеков, дашборд, аудит безопасности и вердикт${NC}"
-        echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Оптимизация стека${NC}    ${DIM}sysctl / BBR / FD / RPS / NIC / TCPMSS / Zram${NC}"
-        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Авто-деплой по API${NC}   ${DIM}Caddy L4 + 2 Инбаунда (Reality + XHTTP) + 2 Хоста${NC}"
-        echo -e "    ${ORANGE}${BOLD}[4]${NC} ${WHITE}Выборочный запуск${NC}    ${DIM}ручная установка или починка отдельных модулей${NC}"
-        echo -e "    ${ORANGE}${BOLD}[5]${NC} ${WHITE}Статус системы${NC}       ${DIM}контейнеры, ядро, UFW ACL, наложенные артефакты${NC}"
-        echo -e "    ${ORANGE}${BOLD}[6]${NC} ${WHITE}Ядро BBRv3 (XanMod)${NC}  ${DIM}установка ядра XanMod под микроархитектуру CPU${NC}"
-        echo -e "    ${ORANGE}${BOLD}[7]${NC} ${WHITE}Сменить шаблон SNI${NC}   ${DIM}быстрая смена HTML-лендинга в /opt/html${NC}"
-        echo -e "    ${ORANGE}${BOLD}[8]${NC} ${WHITE}Обновить компоненты${NC}  ${DIM}docker pull + self-update скрипта с GitHub${NC}"
-        echo -e "    ${ORANGE}${BOLD}[9]${NC} ${WHITE}Откат / Удаление${NC}     ${DIM}снять оптимизации (rollback) или удалить узел${NC}"
+        echo -e "  ${SLATE}${BOLD}РАЗВЕРТЫВАНИЕ И СТЕК ПРОТОКОЛОВ${NC}"
+        echo -e "    ${ORANGE}${BOLD}[5]${NC} ${WHITE}Авто-деплой по API${NC}   ${DIM}Caddy L4 + 2 Инбаунда (Reality + XHTTP) + 2 Хоста${NC}"
+        echo -e "    ${ORANGE}${BOLD}[6]${NC} ${WHITE}Выборочный запуск${NC}    ${DIM}модули: Docker, Caddy, API, NetBird, Monitoring, Protect${NC}"
+        echo -e "    ${ORANGE}${BOLD}[7]${NC} ${WHITE}Сменить шаблон SNI${NC}   ${DIM}быстрая смена HTML-лендинга в /opt/html (10 тем)${NC}"
+        echo
+        echo -e "  ${SLATE}${BOLD}БЕЗОПАСНОСТЬ И ОБСЛУЖИВАНИЕ${NC}"
+        echo -e "    ${ORANGE}${BOLD}[8]${NC} ${WHITE}Статус и Логи${NC}        ${DIM}дашборд служб, NetBird, Мониторинг, просмотр логов${NC}"
+        echo -e "    ${ORANGE}${BOLD}[9]${NC} ${WHITE}Защита (Protect)${NC}     ${DIM}генератор таблиц nftables anti-DDoS + SSH Hardening${NC}"
+        echo -e "   ${ORANGE}${BOLD}[10]${NC} ${WHITE}Обновить компоненты${NC}  ${DIM}docker pull (Node/Caddy/Monitoring) + self-update${NC}"
+        echo -e "   ${ORANGE}${BOLD}[11]${NC} ${WHITE}Откат / Удаление${NC}     ${DIM}снять оптимизации (rollback), экспорт или удалить узел${NC}"
         echo -e "    ${ORANGE}${BOLD}[0]${NC} ${GRAPHITE}Выход${NC}"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-9]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-11]${NC}: "
         local c=""
         read -r c
         echo
@@ -3283,39 +4526,56 @@ show_main_menu() {
             1) run_diagnose ;;
             2)
                 echo -e "  ${BOLD}Режим оптимизации:${NC}"
-                echo -e "    ${ORANGE}[a]${NC} Применить всё (sysctl + FD + RPS + NIC + MSS + journald)"
+                echo -e "    ${ORANGE}[a]${NC} Применить всё (sysctl + BBR/CAKE + FD + RPS/XPS + NIC + MSS + journald)"
                 echo -e "    ${ORANGE}[f]${NC} Исправить только найденное диагностикой (--from-findings)"
+                echo -e "    ${ORANGE}[s]${NC} Включить Smart Traffic Shaper (CAKE dual-srchost — честный канал)"
                 echo -e "    ${ORANGE}[z]${NC} Включить сжатый Zram-swap (50% RAM)"
                 printf "  ${ORANGE}>${NC} Выбор [Enter=a]: "
                 local oc=""
                 read -r oc
                 case "${oc,,}" in
                     f) run_optimize "--from-findings" ;;
+                    s) opt_shaper ;;
                     z) run_optimize "--zram" ;;
                     *) run_optimize "--all" ;;
                 esac
                 ;;
-            3) run_full_install ;;
-            4) run_selective_install ;;
-            5) show_status ;;
-            6) run_bbr3_xanmod ;;
+            3|v) run_verify_stack ;;
+            4) run_bbr3_xanmod ;;
+            5) run_full_install ;;
+            6) run_selective_install ;;
             7) change_template ;;
             8)
-                echo -e "    ${ORANGE}[1]${NC} Обновить контейнеры RemnaNode и Caddy"
+                show_status
+                echo -e "    ${ORANGE}[Enter]${NC} Вернуться в меню   ${ORANGE}[1]${NC} Логи RemnaNode   ${ORANGE}[2]${NC} Логи Caddy   ${ORANGE}[3]${NC} Логи Fail2ban"
+                printf "  ${ORANGE}>${NC} Выбор: "
+                local lc=""
+                read -r lc
+                case "$lc" in
+                    1) show_logs "node" ;;
+                    2) show_logs "caddy" ;;
+                    3) show_logs "f2b" ;;
+                esac
+                ;;
+            9) run_protect ;;
+            10)
+                echo -e "    ${ORANGE}[1]${NC} Обновить контейнеры (RemnaNode, Caddy L4, Мониторинг)"
                 echo -e "    ${ORANGE}[2]${NC} Обновить сам скрипт node-mgr с GitHub (self-update)"
                 printf "  ${ORANGE}>${NC} Выбор [Enter=1]: "
                 local uc=""
                 read -r uc
                 if [ "$uc" = "2" ]; then self_update; else update_components; fi
                 ;;
-            9)
+            11)
                 echo -e "    ${ORANGE}[1]${NC} Откатить только сетевые оптимизации (rollback)"
-                echo -e "    ${ORANGE}[2]${NC} Полностью удалить RemnawaveNode, Caddy и конфиги (uninstall)"
-                printf "  ${ORANGE}>${NC} Выбор [1-2]: "
+                echo -e "    ${ORANGE}[2]${NC} Экспортировать конфигурацию в /etc/remnanode-install.conf"
+                echo -e "    ${ORANGE}[3]${NC} Полностью удалить RemnawaveNode, Caddy, Мониторинг и конфиги (uninstall)"
+                printf "  ${ORANGE}>${NC} Выбор [1-3]: "
                 local rc=""
                 read -r rc
                 if [ "$rc" = "1" ]; then run_rollback; fi
-                if [ "$rc" = "2" ]; then uninstall_all; fi
+                if [ "$rc" = "2" ]; then export_config; fi
+                if [ "$rc" = "3" ]; then uninstall_all; fi
                 ;;
             0|q|"")
                 log_info "Выход."
@@ -3366,23 +4626,34 @@ if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
     auto-deploy|--auto-deploy)         run_api_auto_deploy ;;
     diagnose|diag|--diagnose)          run_diagnose "${1:-full}" ;;
-    optimize|opt|tune|--optimize)      run_optimize "${1:---all}" ;;
+    verify|check|probe|--verify)       run_verify_stack ;;
+    optimize|opt|tune|--optimize)      run_optimize "${1:---all}" "${2:-}" ;;
+    shape|shaper|--shaper)             _init_env; opt_shaper "${1:-}" ;;
+    protect|hardening|--protect)       run_protect ;;
     bbr3|kernel|--bbr3)                run_bbr3_xanmod ;;
     rollback|revert|--rollback)        run_rollback ;;
     status|st|--status)                show_status ;;
     logs|--logs)                       show_logs "${1:-node}" ;;
     install|--install)                 run_full_install ;;
     selective|--selective)             run_selective_install ;;
+    netbird|--netbird)                 _init_env; install_netbird ;;
+    monitoring|--monitoring)           _init_env; install_monitoring ;;
     change-template|--change-template) change_template ;;
     update|--update)                   update_components ;;
     self-update|--self-update)         self_update ;;
     export-config|--export-config)     export_config "${1:-/etc/remnanode-install.conf}" ;;
+    dry-run|--dry-run)                 dry_run ;;
     uninstall|--uninstall)             uninstall_all ;;
     --config)
         if [ -n "${1:-}" ] && [ -f "$1" ]; then
             CONFIG_FILE="$1"
             NON_INTERACTIVE=true
-            main
+            load_config_file "$CONFIG_FILE"
+            if [ "${1:-}" = "--dry-run" ] || [ "${2:-}" = "--dry-run" ]; then
+                dry_run
+            else
+                main
+            fi
         else
             log_error "Укажите существующий файл конфигурации: node-mgr --config /path/to/file"
             exit 1
