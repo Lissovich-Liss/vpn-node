@@ -58,6 +58,9 @@ readonly CADDY_CONTAINER_NAME="caddy-remnawave"
 readonly CADDY_DATA_VOL="selfsteel_caddy_data_selfsteal"
 readonly CADDY_CONFIG_VOL="selfsteel_caddy_config_selfsteal"
 readonly DEFAULT_PORT="9443"
+readonly DEFAULT_VISION_PORT="10443"
+readonly DEFAULT_XHTTP_PORT="10444"
+readonly DEFAULT_XHTTP_PATH="/api/v3/sync/r1"
 
 mkdir -p "$(dirname "$INSTALL_LOG")" "$ND_STATE_DIR" 2>/dev/null || true
 if [ -f "$INSTALL_LOG" ] && [ "$(stat -c%s "$INSTALL_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
@@ -87,13 +90,17 @@ trap '_cleanup_on_exit' EXIT
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/remnanode-install.conf}"
 
-# Переменные для API-автоматизации Remnawave
+# Переменные для API-автоматизации Remnawave и L4 Multi-Protocol
 REMNAWAVE_API_URL="${REMNAWAVE_API_URL:-}"
 REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN:-}"
 NODE_NAME="${NODE_NAME:-}"
 NODE_ADDRESS="${NODE_ADDRESS:-}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN:-}"
+XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-}"
+XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
+VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
+XHTTP_INBOUND_PORT="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
 
 # Классические CFG_* переменные (совместимость)
 CFG_SECRET_KEY="${CFG_SECRET_KEY:-}"
@@ -117,10 +124,12 @@ STATUS_FAIL2BAN="пропущен"
 DETAIL_REMNANODE_PORT=""
 DETAIL_PANEL_IP=""
 DETAIL_CADDY_DOMAIN=""
+DETAIL_XHTTP_DOMAIN=""
 DETAIL_CADDY_PORT=""
 DETAIL_NODE_UUID=""
 DETAIL_PROFILE_UUID=""
 DETAIL_HOST_UUID=""
+DETAIL_XHTTP_HOST_UUID=""
 NODE_IP=""
 OS=""
 PKG_MANAGER=""
@@ -357,7 +366,7 @@ get_saved_caddy_port() {
 }
 
 get_saved_caddy_domain() {
-    local cdom="${DETAIL_CADDY_DOMAIN:-}"
+    local cdom="${DETAIL_CADDY_DOMAIN:-${SELF_STEAL_DOMAIN:-}}"
     if [ -z "$cdom" ] && [ -f "$CADDY_DIR/.env" ]; then
         cdom=$(grep -E '^SELF_STEAL_DOMAIN=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
@@ -365,6 +374,17 @@ get_saved_caddy_domain() {
         cdom=$(grep -E '^SELF_STEAL_DOMAIN=' "/opt/caddy/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
     echo "$cdom"
+}
+
+get_saved_xhttp_domain() {
+    local xdom="${DETAIL_XHTTP_DOMAIN:-${XHTTP_STEAL_DOMAIN:-}}"
+    if [ -z "$xdom" ] && [ -f "$CADDY_DIR/.env" ]; then
+        xdom=$(grep -E '^XHTTP_STEAL_DOMAIN=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    if [ -z "$xdom" ] && [ -f "$API_STATE_FILE" ]; then
+        xdom=$(grep -E '^XHTTP_STEAL_DOMAIN=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    echo "$xdom"
 }
 
 spinner() {
@@ -633,7 +653,7 @@ backup_existing_config() {
     local backup_dir="${dir}.backup.$(date +%Y%m%d_%H%M%S)"
     if [ -d "$dir" ]; then
         mkdir -p "$backup_dir"
-        for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile; do
+        for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile "$dir"/Dockerfile; do
             if [ -f "$f" ]; then cp -f "$f" "$backup_dir/" 2>/dev/null || true; fi
         done
         chmod 700 "$backup_dir"
@@ -645,7 +665,7 @@ load_config_file() {
     local config_file="${1:-$CONFIG_FILE}"
     if [ -f "$config_file" ]; then
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN SELF_STEAL_PORT CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -897,12 +917,13 @@ EOF
     box_bottom
     echo
 
-    # ── Блок 4: Контейнеры RemnawaveNode и Caddy Selfsteal (19-23) ─
-    box_top "4/5 · DOCKER, REMNANODE И CADDY SELFSTEAL (ЧЕКИ 19–23)"
-    local node_port caddy_port caddy_domain
+    # ── Блок 4: Контейнеры RemnawaveNode и Caddy Selfsteal L4 (19-23) ─
+    box_top "4/5 · DOCKER, REMNANODE И CADDY L4 SELFSTEAL (ЧЕКИ 19–23)"
+    local node_port caddy_port caddy_domain xhttp_domain
     node_port=$(get_saved_node_port)
     caddy_port=$(get_saved_caddy_port)
     caddy_domain=$(get_saved_caddy_domain)
+    xhttp_domain=$(get_saved_xhttp_domain)
     local ss_listening
     ss_listening=$(ss -tln 2>/dev/null || true)
 
@@ -923,13 +944,13 @@ EOF
     fi
 
     if is_caddy_running; then
-        _chk_ok "21. Контейнер Caddy Selfsteal" "Запущен (домен: ${caddy_domain:-?})"
+        _chk_ok "21. Контейнер Caddy L4" "Запущен (Vision: ${caddy_domain:-?} | XHTTP: ${xhttp_domain:-?})"
     else
-        _chk_fail "21. Контейнер Caddy Selfsteal" "Не установлен или остановлен"
+        _chk_fail "21. Контейнер Caddy L4" "Не установлен или остановлен"
     fi
 
     if awk '{print $4}' <<< "$ss_listening" | grep -q "^127\.0\.0\.1:${caddy_port}$"; then
-        _chk_ok "22. Изоляция Selfsteal сокета" "Слушает строго на 127.0.0.1:${caddy_port}"
+        _chk_ok "22. Изоляция Selfsteal сокета" "Слушает строго на 127.0.0.1:${caddy_port} (L4 на :443)"
     elif grep -qE ":${caddy_port}[[:space:]]" <<< "$ss_listening"; then
         _chk_fail "22. Изоляция Selfsteal сокета" "УТЕЧКА: порт ${caddy_port} слушает публично!"
     else
@@ -938,17 +959,23 @@ EOF
 
     if is_caddy_running && [ -n "$caddy_domain" ]; then
         local clean_dom="${caddy_domain#\*.}"
+        local clean_xdom="${xhttp_domain#\*.}"
         local active_cname="$CADDY_CONTAINER_NAME"
         if ! is_container_running "$active_cname"; then active_cname="caddy-selfsteal"; fi
-        local cert_end=""
-        cert_end=$(docker exec "$active_cname" sh -c "find /data/caddy/certificates -type f -name '*${clean_dom}*.crt' 2>/dev/null | head -1" 2>/dev/null || true)
-        if [ -n "$cert_end" ]; then
-            _chk_ok "23. TLS-сертификат маскировки" "Выпущен (${clean_dom})"
+        local cert_v="" cert_x=""
+        cert_v=$(docker exec "$active_cname" sh -c "find /data/caddy/certificates -type f -name '*${clean_dom}*.crt' 2>/dev/null | head -1" 2>/dev/null || true)
+        if [ -n "$clean_xdom" ]; then
+            cert_x=$(docker exec "$active_cname" sh -c "find /data/caddy/certificates -type f -name '*${clean_xdom}*.crt' 2>/dev/null | head -1" 2>/dev/null || true)
+        fi
+        if [ -n "$cert_v" ] && { [ -z "$clean_xdom" ] || [ -n "$cert_x" ]; }; then
+            _chk_ok "23. TLS-сертификаты маскировки" "Выпущены (${clean_dom}${clean_xdom:+, $clean_xdom})"
+        elif [ -n "$cert_v" ]; then
+            _chk_warn "23. TLS-сертификаты маскировки" "Выпущен ${clean_dom}, ожидается ${clean_xdom}"
         else
-            _chk_warn "23. TLS-сертификат маскировки" "Сертификат для ${clean_dom} еще не получен"
+            _chk_warn "23. TLS-сертификаты маскировки" "Сертификаты для ${clean_dom} еще не получены"
         fi
     else
-        _chk_warn "23. TLS-сертификат маскировки" "Контейнер Caddy или домен не активен"
+        _chk_warn "23. TLS-сертификаты маскировки" "Контейнер Caddy или домен не активен"
     fi
     box_bottom
     echo
@@ -1705,17 +1732,32 @@ wait_for_caddy_certificate() {
     return 0
 }
 
-# ── Развертывание Caddy Selfsteal в /opt/selfsteel ────────────────
+# ── Генерация дефолтного второго поддомена для XHTTP из первого ───
+suggest_xhttp_domain() {
+    local d1="$1"
+    local prefix="${d1%%.*}"
+    local rest="${d1#*.}"
+    if [[ "$prefix" =~ ^([a-zA-Z-]+)1$ ]]; then
+        echo "${BASH_REMATCH[1]}2.${rest}"
+    elif [[ "$prefix" =~ ^([a-zA-Z-]+)-01$ ]]; then
+        echo "${BASH_REMATCH[1]}-02.${rest}"
+    else
+        echo "xhttp.${rest}"
+    fi
+}
+
+# ── Развертывание Caddy L4 + Selfsteal в /opt/selfsteel ───────────
 install_caddy_selfsteal() {
-    print_header "РАЗВЕРТЫВАНИЕ CADDY SELFSTEAL (/opt/selfsteel)"
+    print_header "РАЗВЕРТЫВАНИЕ CADDY L4 + SELFSTEAL (/opt/selfsteel)"
 
     if check_existing_caddy && [ "${NON_INTERACTIVE:-false}" != true ]; then
-        log_warning "Caddy Selfsteal уже установлен в $CADDY_DIR"
+        log_warning "Caddy L4 Selfsteal уже установлен в $CADDY_DIR"
         echo -e "    ${ORANGE}1)${NC} Пропустить   ${ORANGE}2)${NC} Перезаписать (с бэкапом)"
         local cc; prompt_choice "Выбор [1-2]: " 2 cc "1"
         if [ "$cc" = "1" ]; then
             STATUS_CADDY="уже установлен"
             DETAIL_CADDY_DOMAIN=$(get_saved_caddy_domain)
+            DETAIL_XHTTP_DOMAIN=$(get_saved_xhttp_domain)
             DETAIL_CADDY_PORT=$(get_saved_caddy_port)
             return 0
         fi
@@ -1726,7 +1768,7 @@ install_caddy_selfsteal() {
     local domain="${SELF_STEAL_DOMAIN:-${CFG_DOMAIN:-}}"
     if [ "${NON_INTERACTIVE:-false}" != true ] && [ -z "$domain" ]; then
         while [ -z "$domain" ]; do
-            read -p "  ${ORANGE}>${NC} Домен для fallback/SNI (SELF_STEAL_DOMAIN): " -r domain
+            read -p "  ${ORANGE}>${NC} 1-й поддомен для VLESS Reality Vision (SELF_STEAL_DOMAIN): " -r domain
             domain=$(echo "$domain" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
             if ! [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
                 log_warning "Некорректный формат домена!"
@@ -1736,6 +1778,30 @@ install_caddy_selfsteal() {
     fi
     SELF_STEAL_DOMAIN="$domain"
     DETAIL_CADDY_DOMAIN="$domain"
+
+    local def_xhttp_dom
+    def_xhttp_dom=$(suggest_xhttp_domain "$SELF_STEAL_DOMAIN")
+    local xdomain="${XHTTP_STEAL_DOMAIN:-}"
+    if [ -z "$xdomain" ]; then
+        if [ "${NON_INTERACTIVE:-false}" = true ]; then
+            xdomain="$def_xhttp_dom"
+        else
+            while [ -z "$xdomain" ]; do
+                read -p "  ${ORANGE}>${NC} 2-й поддомен для VLESS Reality XHTTP (XHTTP_STEAL_DOMAIN) [${def_xhttp_dom}]: " -r xdomain
+                xdomain="${xdomain:-$def_xhttp_dom}"
+                xdomain=$(echo "$xdomain" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+                if ! [[ "$xdomain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+                    log_warning "Некорректный формат домена!"
+                    xdomain=""
+                elif [ "$xdomain" = "$SELF_STEAL_DOMAIN" ]; then
+                    log_warning "Поддомен для XHTTP должен отличаться от Vision (${SELF_STEAL_DOMAIN}) для L4 SNI-маршрутизации!"
+                    xdomain=""
+                fi
+            done
+        fi
+    fi
+    XHTTP_STEAL_DOMAIN="$xdomain"
+    DETAIL_XHTTP_DOMAIN="$xdomain"
 
     local port="${SELF_STEAL_PORT:-${CFG_CADDY_PORT:-$DEFAULT_PORT}}"
     if [ "${NON_INTERACTIVE:-false}" != true ] && [ -z "${SELF_STEAL_PORT:-}" ]; then
@@ -1768,33 +1834,60 @@ install_caddy_selfsteal() {
     umask 077
     cat > "$CADDY_DIR/.env" << EOF
 SELF_STEAL_DOMAIN=${SELF_STEAL_DOMAIN}
+XHTTP_STEAL_DOMAIN=${XHTTP_STEAL_DOMAIN}
 SELF_STEAL_PORT=${SELF_STEAL_PORT}
+VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
+XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
 EOF
     chmod 600 "$CADDY_DIR/.env"
     umask 022
 
-    # 3. Генерация /opt/selfsteel/Caddyfile (с поддержкой proxy_protocol + tls)
+    # 3. Генерация Dockerfile для сборки Caddy с модулем github.com/mholt/caddy-l4
+    cat > "$CADDY_DIR/Dockerfile" << 'EOF'
+FROM caddy:2-builder AS builder
+RUN xcaddy build --with github.com/mholt/caddy-l4
+
+FROM caddy:2
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+EOF
+
+    # 4. Генерация /opt/selfsteel/Caddyfile (L4 SNI-роутинг на :443 + Selfsteal HTTPS на 127.0.0.1:9443)
     cat > "$CADDY_DIR/Caddyfile" << 'EOF'
 {
     https_port {$SELF_STEAL_PORT}
     default_bind 127.0.0.1
-    servers {
-        listener_wrappers {
-            proxy_protocol {
-                allow 127.0.0.1/32
+    auto_https disable_redirects
+
+    layer4 {
+        0.0.0.0:443 {
+            @vision tls sni {$SELF_STEAL_DOMAIN}
+            route @vision {
+                proxy 127.0.0.1:{$VISION_INBOUND_PORT}
             }
-            tls
+
+            @xhttp tls sni {$XHTTP_STEAL_DOMAIN}
+            route @xhttp {
+                proxy 127.0.0.1:{$XHTTP_INBOUND_PORT}
+            }
+
+            route {
+                proxy 127.0.0.1:{$SELF_STEAL_PORT}
+            }
         }
     }
-    auto_https disable_redirects
 }
 
-http://{$SELF_STEAL_DOMAIN} {
+http://{$SELF_STEAL_DOMAIN}, http://{$XHTTP_STEAL_DOMAIN} {
     bind 0.0.0.0
-    redir https://{$SELF_STEAL_DOMAIN}{uri} permanent
+    redir https://{host}{uri} permanent
 }
 
-https://{$SELF_STEAL_DOMAIN} {
+https://{$SELF_STEAL_DOMAIN}, https://{$XHTTP_STEAL_DOMAIN} {
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
     root * /var/www/html
     try_files {path} /index.html
     file_server
@@ -1818,11 +1911,14 @@ https://{$SELF_STEAL_DOMAIN} {
 }
 EOF
 
-    # 4. Генерация /opt/selfsteel/docker-compose.yml
+    # 5. Генерация /opt/selfsteel/docker-compose.yml
     cat > "$CADDY_DIR/docker-compose.yml" << 'EOF'
 services:
   caddy:
-    image: caddy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: caddy-l4:local
     container_name: caddy-remnawave
     restart: unless-stopped
     volumes:
@@ -1842,14 +1938,18 @@ volumes:
     name: selfsteel_caddy_config_selfsteal
 EOF
 
-    # 5. Запуск контейнера Caddy и ожидание сертификата
+    # 6. Сборка (при необходимости) и запуск контейнера Caddy L4 + ожидание сертификатов
     docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
-    docker compose --project-directory "$CADDY_DIR" pull --quiet 2>/dev/null || true
+    if ! docker image inspect caddy-l4:local >/dev/null 2>&1; then
+        log_info "Сборка образа Caddy с модулем layer4 (github.com/mholt/caddy-l4)..."
+        docker compose --project-directory "$CADDY_DIR" build
+    fi
     docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
 
     if check_container_health "$CADDY_CONTAINER_NAME" 30; then
-        log_success "Контейнер ${CADDY_CONTAINER_NAME} запущен (127.0.0.1:${SELF_STEAL_PORT})"
+        log_success "Контейнер ${CADDY_CONTAINER_NAME} запущен (L4 :443 -> Vision :${VISION_INBOUND_PORT} / XHTTP :${XHTTP_INBOUND_PORT} | Selfsteal 127.0.0.1:${SELF_STEAL_PORT})"
         wait_for_caddy_certificate "$SELF_STEAL_DOMAIN" 60
+        wait_for_caddy_certificate "$XHTTP_STEAL_DOMAIN" 60
         STATUS_CADDY="установлен"
     else
         log_error "Контейнер ${CADDY_CONTAINER_NAME} не запустился. Проверьте: node-mgr logs caddy"
@@ -2068,10 +2168,42 @@ collect_api_inputs() {
 
     if [ -z "$SELF_STEAL_DOMAIN" ]; then
         while [ -z "$SELF_STEAL_DOMAIN" ]; do
-            read -p "  ${ORANGE}>${NC} Домен маскировки SNI (SELF_STEAL_DOMAIN): " -r SELF_STEAL_DOMAIN
+            read -p "  ${ORANGE}>${NC} 1-й поддомен для VLESS Reality Vision (SELF_STEAL_DOMAIN): " -r SELF_STEAL_DOMAIN
             SELF_STEAL_DOMAIN=$(echo "$SELF_STEAL_DOMAIN" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+            if ! [[ "$SELF_STEAL_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+                log_warning "Некорректный формат домена!"
+                SELF_STEAL_DOMAIN=""
+            fi
         done
     fi
+
+    local def_xhttp_dom
+    def_xhttp_dom=$(suggest_xhttp_domain "$SELF_STEAL_DOMAIN")
+    if [ -z "$XHTTP_STEAL_DOMAIN" ]; then
+        if [ "${NON_INTERACTIVE:-false}" = true ]; then
+            XHTTP_STEAL_DOMAIN="$def_xhttp_dom"
+        else
+            while [ -z "$XHTTP_STEAL_DOMAIN" ]; do
+                read -p "  ${ORANGE}>${NC} 2-й поддомен для VLESS Reality XHTTP (XHTTP_STEAL_DOMAIN) [${def_xhttp_dom}]: " -r XHTTP_STEAL_DOMAIN
+                XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-$def_xhttp_dom}"
+                XHTTP_STEAL_DOMAIN=$(echo "$XHTTP_STEAL_DOMAIN" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+                if ! [[ "$XHTTP_STEAL_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+                    log_warning "Некорректный формат домена!"
+                    XHTTP_STEAL_DOMAIN=""
+                elif [ "$XHTTP_STEAL_DOMAIN" = "$SELF_STEAL_DOMAIN" ]; then
+                    log_warning "Поддомен для XHTTP должен отличаться от Vision (${SELF_STEAL_DOMAIN}) для L4 SNI-роутинга!"
+                    XHTTP_STEAL_DOMAIN=""
+                fi
+            done
+        fi
+    fi
+
+    if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        local input_xpath=""
+        read -p "  ${ORANGE}>${NC} Путь XHTTP (XHTTP_PATH) [${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}]: " -r input_xpath
+        XHTTP_PATH="${input_xpath:-${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}}"
+    fi
+    XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
 
     if [ -z "${SELF_STEAL_PORT:-}" ]; then
         SELF_STEAL_PORT="$DEFAULT_PORT"
@@ -2096,16 +2228,17 @@ collect_api_inputs() {
 }
 
 automate_remnawave_api() {
-    print_header "АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ В ПАНЕЛИ REMNAWAVE API"
+    print_header "АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ В ПАНЕЛИ REMNAWAVE API (L4: REALITY + XHTTP)"
 
-    # Режим безопасности для xhttp: "reality" (с fallback на Caddy) или "tls" (с прямым чтением сертификатов Let's Encrypt)
-    # По умолчанию создаем комбинированный конфиг или используем оба блока согласно схеме Remnawave
-    local cert_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.crt"
-    local key_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.key"
+    local xhttp_dom="${XHTTP_STEAL_DOMAIN:-$(suggest_xhttp_domain "$SELF_STEAL_DOMAIN")}"
+    local xhttp_path="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
+    local vision_port="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
+    local xhttp_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
 
     local clean_node_name="${NODE_NAME//[^a-zA-Z0-9_-]/}"
     local profile_name="Profile-${clean_node_name}"
-    local inbound_tag="VLESS-XHTTP-${clean_node_name}"
+    local vision_tag="VLESS-REALITY-${clean_node_name}"
+    local xhttp_tag="VLESS-XHTTP-${clean_node_name}"
 
     # Генерация ключей Reality (X25519) и shortId
     local keypair priv_key pub_key short_id
@@ -2114,18 +2247,21 @@ automate_remnawave_api() {
     pub_key="${keypair##*:}"
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4e5f60718")
 
-    # ── ШАГ 1: Создание или получение Config Profile (/api/config-profiles) ──
-    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}'..."
-    local profile_payload profile_resp="" profile_uuid="" inbound_uuid=""
+    # ── ШАГ 1: Создание или обновление Config Profile (/api/config-profiles) ─
+    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}' (2 инбаунда: Reality Vision + XHTTP)..."
+    local profile_payload profile_resp="" profile_uuid="" vision_inbound_uuid="" xhttp_inbound_uuid=""
 
-    # Формируем JSON строго по схеме POST /api/config-profiles панели Remnawave
+    # Формируем JSON с двумя инбаундами за Caddy L4 (127.0.0.1:10443 Vision + 127.0.0.1:10444 XHTTP -> fallback 127.0.0.1:9443)
     profile_payload=$(jq -n \
         --arg name "$profile_name" \
-        --arg tag "$inbound_tag" \
-        --arg dom "$SELF_STEAL_DOMAIN" \
+        --arg v_tag "$vision_tag" \
+        --arg x_tag "$xhttp_tag" \
+        --argjson v_port "$vision_port" \
+        --argjson x_port "$xhttp_port" \
+        --arg v_dom "$SELF_STEAL_DOMAIN" \
+        --arg x_dom "$xhttp_dom" \
+        --arg x_path "$xhttp_path" \
         --arg dest "127.0.0.1:${SELF_STEAL_PORT}" \
-        --arg cert "$cert_path" \
-        --arg key "$key_path" \
         --arg pk "$priv_key" \
         --arg sid "$short_id" \
         '{
@@ -2134,45 +2270,73 @@ automate_remnawave_api() {
                 log: {
                     loglevel: "warning"
                 },
+                dns: {
+                    servers: ["1.1.1.1", "8.8.8.8"],
+                    queryStrategy: "UseIPv4"
+                },
                 inbounds: [
                     {
-                        tag: $tag,
-                        port: 443,
+                        tag: $v_tag,
+                        port: $v_port,
+                        listen: "127.0.0.1",
                         protocol: "vless",
                         settings: {
                             clients: [],
                             decryption: "none"
                         },
+                        sniffing: {
+                            enabled: true,
+                            routeOnly: true,
+                            destOverride: ["http", "tls", "quic"]
+                        },
+                        streamSettings: {
+                            network: "raw",
+                            security: "reality",
+                            rawSettings: {
+                                acceptProxyProtocol: false
+                            },
+                            realitySettings: {
+                                show: false,
+                                xver: 0,
+                                dest: $dest,
+                                target: $dest,
+                                serverNames: [$v_dom],
+                                privateKey: $pk,
+                                shortIds: [$sid]
+                            }
+                        }
+                    },
+                    {
+                        tag: $x_tag,
+                        port: $x_port,
+                        listen: "127.0.0.1",
+                        protocol: "vless",
+                        settings: {
+                            clients: [],
+                            decryption: "none"
+                        },
+                        sniffing: {
+                            enabled: true,
+                            routeOnly: true,
+                            destOverride: ["http", "tls", "quic"]
+                        },
                         streamSettings: {
                             network: "xhttp",
                             security: "reality",
                             xhttpSettings: {
-                                host: $dom,
-                                path: "/",
+                                host: $x_dom,
+                                path: $x_path,
                                 mode: "auto"
-                            },
-                            tlsSettings: {
-                                serverName: $dom,
-                                alpn: ["h2", "http/1.1"],
-                                certificates: [
-                                    {
-                                        certificateFile: $cert,
-                                        keyFile: $key
-                                    }
-                                ]
                             },
                             realitySettings: {
                                 show: false,
+                                xver: 0,
                                 dest: $dest,
-                                xver: 1,
-                                serverNames: [$dom],
+                                target: $dest,
+                                serverNames: [$x_dom],
                                 privateKey: $pk,
                                 shortIds: [$sid]
                             }
-                        },
-                        sniffing: {
-                            enabled: true,
-                            destOverride: ["http", "tls", "quic"]
                         }
                     }
                 ],
@@ -2194,12 +2358,17 @@ automate_remnawave_api() {
                     rules: [
                         {
                             type: "field",
+                            protocol: ["bittorrent"],
+                            outboundTag: "BLOCK"
+                        },
+                        {
+                            type: "field",
                             ip: ["geoip:private"],
                             outboundTag: "BLOCK"
                         },
                         {
                             type: "field",
-                            protocol: ["bittorrent"],
+                            domain: ["geosite:private"],
                             outboundTag: "BLOCK"
                         }
                     ]
@@ -2217,12 +2386,30 @@ automate_remnawave_api() {
         ' 2>/dev/null || true)
 
         if [ -n "$profile_uuid" ]; then
-            inbound_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" --arg t "$inbound_tag" '
-                (.response.configProfiles // .response // .data // [])
-                | map(select(.name == $n))[0].inbounds
-                | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
-            ' 2>/dev/null || true)
-            log_info "Найден существующий профиль '${profile_name}' (UUID: ${profile_uuid})"
+            log_info "Найден существующий профиль '${profile_name}' (UUID: ${profile_uuid}), обновляем инбаунды..."
+            local patch_profile_payload
+            patch_profile_payload=$(echo "$profile_payload" | jq --arg u "$profile_uuid" '. + {uuid: $u}')
+            if profile_resp=$(remnawave_api_request "PATCH" "/api/config-profiles" "$patch_profile_payload" 2>/dev/null); then
+                vision_inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$vision_tag" '
+                    (.response.inbounds // .data.inbounds // .inbounds // [])
+                    | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+                ' 2>/dev/null || true)
+                xhttp_inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$xhttp_tag" '
+                    (.response.inbounds // .data.inbounds // .inbounds // [])
+                    | (map(select(.tag == $t))[0].uuid // .[1].uuid) // empty
+                ' 2>/dev/null || true)
+            else
+                vision_inbound_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" --arg t "$vision_tag" '
+                    (.response.configProfiles // .response // .data // [])
+                    | map(select(.name == $n))[0].inbounds
+                    | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+                ' 2>/dev/null || true)
+                xhttp_inbound_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" --arg t "$xhttp_tag" '
+                    (.response.configProfiles // .response // .data // [])
+                    | map(select(.name == $n))[0].inbounds
+                    | (map(select(.tag == $t))[0].uuid // .[1].uuid) // empty
+                ' 2>/dev/null || true)
+            fi
         fi
     fi
 
@@ -2230,9 +2417,13 @@ automate_remnawave_api() {
     if [ -z "$profile_uuid" ]; then
         if profile_resp=$(remnawave_api_request "POST" "/api/config-profiles" "$profile_payload"); then
             profile_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
-            inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$inbound_tag" '
+            vision_inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$vision_tag" '
                 (.response.inbounds // .data.inbounds // .inbounds // [])
                 | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+            ')
+            xhttp_inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$xhttp_tag" '
+                (.response.inbounds // .data.inbounds // .inbounds // [])
+                | (map(select(.tag == $t))[0].uuid // .[1].uuid) // empty
             ')
         else
             log_error "Не удалось создать Config Profile через POST /api/config-profiles!"
@@ -2241,17 +2432,24 @@ automate_remnawave_api() {
         fi
     fi
 
-    # 1.3 Если inbound_uuid всё ещё пуст, запрашиваем детали конкретного профиля по UUID
-    if [ -n "$profile_uuid" ] && [ -z "$inbound_uuid" ]; then
+    # 1.3 Если UUID инбаундов ещё пусты, запрашиваем детали конкретного профиля по UUID
+    if [ -n "$profile_uuid" ] && { [ -z "$vision_inbound_uuid" ] || [ -z "$xhttp_inbound_uuid" ]; }; then
         local single_prof=""
         single_prof=$(remnawave_api_request "GET" "/api/config-profiles/${profile_uuid}" "" 2>/dev/null || true)
         if [ -n "$single_prof" ]; then
-            inbound_uuid=$(echo "$single_prof" | jq -r '(.response.inbounds // .data.inbounds // [])[0].uuid // empty')
+            [ -z "$vision_inbound_uuid" ] && vision_inbound_uuid=$(echo "$single_prof" | jq -r --arg t "$vision_tag" '
+                (.response.inbounds // .data.inbounds // [])
+                | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+            ')
+            [ -z "$xhttp_inbound_uuid" ] && xhttp_inbound_uuid=$(echo "$single_prof" | jq -r --arg t "$xhttp_tag" '
+                (.response.inbounds // .data.inbounds // [])
+                | (map(select(.tag == $t))[0].uuid // .[1].uuid) // empty
+            ')
         fi
     fi
 
     DETAIL_PROFILE_UUID="$profile_uuid"
-    log_success "Профиль активен: Profile UUID=${profile_uuid} | Inbound UUID=${inbound_uuid}"
+    log_success "Профиль активен: Profile=${profile_uuid} | Vision Inbound=${vision_inbound_uuid} | XHTTP Inbound=${xhttp_inbound_uuid}"
 
     # ── ШАГ 2: Создание или получение Ноды (/api/nodes + /api/keygen) ───────
     log_info "Шаг 2/3: Регистрация ноды '${NODE_NAME}' (${NODE_ADDRESS})..."
@@ -2276,14 +2474,15 @@ automate_remnawave_api() {
         ' 2>/dev/null || true)
     fi
 
-    # 2.2 Если нода ещё не создана — регистрируем через POST /api/nodes
+    # 2.2 Если нода ещё не создана — регистрируем через POST /api/nodes с обоими инбаундами
     if [ -z "$node_uuid" ]; then
         node_payload=$(jq -n \
             --arg name "$NODE_NAME" \
             --arg addr "$NODE_ADDRESS" \
             --argjson port "$req_node_port" \
             --arg p_uuid "$profile_uuid" \
-            --arg i_uuid "$inbound_uuid" \
+            --arg v_uuid "$vision_inbound_uuid" \
+            --arg x_uuid "$xhttp_inbound_uuid" \
             '{
                 name: $name,
                 address: $addr,
@@ -2291,7 +2490,7 @@ automate_remnawave_api() {
                 isTrafficTrackingActive: false,
                 configProfile: {
                     activeConfigProfileUuid: $p_uuid,
-                    activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
+                    activeInbounds: ([$v_uuid, $x_uuid] | map(select(. != "")))
                 }
             }')
 
@@ -2306,17 +2505,18 @@ automate_remnawave_api() {
         fi
     else
         log_info "Найдена существующая нода '${NODE_NAME}' (UUID: ${node_uuid})"
-        # Обновляем привязку профиля и инбаунда у существующей ноды
+        # Обновляем привязку профиля и обоих инбаундов у существующей ноды
         local update_node_payload
         update_node_payload=$(jq -n \
             --arg uuid "$node_uuid" \
             --arg p_uuid "$profile_uuid" \
-            --arg i_uuid "$inbound_uuid" \
+            --arg v_uuid "$vision_inbound_uuid" \
+            --arg x_uuid "$xhttp_inbound_uuid" \
             '{
                 uuid: $uuid,
                 configProfile: {
                     activeConfigProfileUuid: $p_uuid,
-                    activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
+                    activeInbounds: ([$v_uuid, $x_uuid] | map(select(. != "")))
                 }
             }')
         remnawave_api_request "PATCH" "/api/nodes" "$update_node_payload" >/dev/null 2>&1 || true
@@ -2379,38 +2579,72 @@ automate_remnawave_api() {
     DETAIL_NODE_UUID="$node_uuid"
     log_success "Нода синхронизирована: UUID=${node_uuid} | NODE_PORT=${CFG_NODE_PORT}"
 
-    # ── ШАГ 3: Создание Хоста (/api/hosts) ──────────────────────────────────
-    log_info "Шаг 3/3: Привязка Хоста (${SELF_STEAL_DOMAIN}:443) к Inbound..."
-    local host_payload host_resp="" host_uuid=""
+    # ── ШАГ 3: Создание двух Хостов (/api/hosts) на публичном порту 443 ─────
+    log_info "Шаг 3/3: Привязка 2 Хостов (Reality Vision + XHTTP на :443) к Инбаундам..."
+    local vision_host_payload xhttp_host_payload host_resp="" host_uuid="" xhttp_host_uuid=""
 
-    host_payload=$(jq -n \
-        --arg remark "$NODE_NAME" \
-        --arg addr "$SELF_STEAL_DOMAIN" \
-        --arg sni "$SELF_STEAL_DOMAIN" \
-        --arg p_uuid "$profile_uuid" \
-        --arg i_uuid "$inbound_uuid" \
-        '{
-            remark: $remark,
-            address: $addr,
-            port: 443,
-            sni: $sni,
-            host: $addr,
-            path: "/",
-            securityLayer: "DEFAULT",
-            alpn: "h2,http/1.1",
-            fingerprint: "chrome",
-            inbound: {
-                configProfileUuid: $p_uuid,
-                configProfileInboundUuid: $i_uuid
-            }
-        }')
+    # 3.1 Хост 1: VLESS Reality Vision (порт 443 -> Caddy L4 -> 127.0.0.1:10443)
+    if [ -n "$vision_inbound_uuid" ]; then
+        vision_host_payload=$(jq -n \
+            --arg remark "${NODE_NAME} [Reality]" \
+            --arg addr "$SELF_STEAL_DOMAIN" \
+            --arg sni "$SELF_STEAL_DOMAIN" \
+            --arg p_uuid "$profile_uuid" \
+            --arg i_uuid "$vision_inbound_uuid" \
+            '{
+                remark: $remark,
+                address: $addr,
+                port: 443,
+                sni: $sni,
+                securityLayer: "DEFAULT",
+                fingerprint: "chrome",
+                inbound: {
+                    configProfileUuid: $p_uuid,
+                    configProfileInboundUuid: $i_uuid
+                }
+            }')
 
-    if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$host_payload" 2>/dev/null); then
-        host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
-        DETAIL_HOST_UUID="$host_uuid"
-        log_success "Хост создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443)"
-    else
-        log_warning "Хост для ${SELF_STEAL_DOMAIN} уже существует или требует проверки в панели."
+        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$vision_host_payload" 2>/dev/null); then
+            host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
+            DETAIL_HOST_UUID="$host_uuid"
+            log_success "Хост Reality Vision создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443 -> 127.0.0.1:${vision_port})"
+        else
+            log_warning "Хост Reality Vision (${SELF_STEAL_DOMAIN}) уже существует или требует проверки в панели."
+        fi
+    fi
+
+    # 3.2 Хост 2: VLESS Reality XHTTP (порт 443 -> Caddy L4 -> 127.0.0.1:10444)
+    if [ -n "$xhttp_inbound_uuid" ]; then
+        xhttp_host_payload=$(jq -n \
+            --arg remark "${NODE_NAME} [XHTTP]" \
+            --arg addr "$xhttp_dom" \
+            --arg sni "$xhttp_dom" \
+            --arg path "$xhttp_path" \
+            --arg p_uuid "$profile_uuid" \
+            --arg i_uuid "$xhttp_inbound_uuid" \
+            '{
+                remark: $remark,
+                address: $addr,
+                port: 443,
+                sni: $sni,
+                host: $addr,
+                path: $path,
+                securityLayer: "DEFAULT",
+                alpn: "h2,http/1.1",
+                fingerprint: "chrome",
+                inbound: {
+                    configProfileUuid: $p_uuid,
+                    configProfileInboundUuid: $i_uuid
+                }
+            }')
+
+        if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$xhttp_host_payload" 2>/dev/null); then
+            xhttp_host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
+            DETAIL_XHTTP_HOST_UUID="$xhttp_host_uuid"
+            log_success "Хост Reality XHTTP создан: UUID=${xhttp_host_uuid} (${xhttp_dom}:443 path=${xhttp_path} -> 127.0.0.1:${xhttp_port})"
+        else
+            log_warning "Хост Reality XHTTP (${xhttp_dom}) уже существует или требует проверки в панели."
+        fi
     fi
 
     umask 077
@@ -2420,10 +2654,16 @@ NODE_NAME="${NODE_NAME}"
 NODE_ADDRESS="${NODE_ADDRESS}"
 NODE_UUID="${DETAIL_NODE_UUID}"
 PROFILE_UUID="${DETAIL_PROFILE_UUID}"
-INBOUND_UUID="${inbound_uuid}"
-HOST_UUID="${DETAIL_HOST_UUID}"
+VISION_INBOUND_UUID="${vision_inbound_uuid}"
+XHTTP_INBOUND_UUID="${xhttp_inbound_uuid}"
+VISION_HOST_UUID="${DETAIL_HOST_UUID}"
+XHTTP_HOST_UUID="${DETAIL_XHTTP_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
+XHTTP_STEAL_DOMAIN="${xhttp_dom}"
+XHTTP_PATH="${xhttp_path}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT}"
+VISION_INBOUND_PORT="${vision_port}"
+XHTTP_INBOUND_PORT="${xhttp_port}"
 REALITY_PUBLIC_KEY="${pub_key}"
 REALITY_SHORT_ID="${short_id}"
 PANEL_IP="${CFG_PANEL_IP}"
@@ -2831,7 +3071,7 @@ show_status() {
     _init_env
     print_banner
     echo
-    local cc qdisc rmem_mb ssh_p panel_ip node_p caddy_p caddy_dom
+    local cc qdisc rmem_mb ssh_p panel_ip node_p caddy_p caddy_dom xhttp_dom
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
     rmem_mb=$(( $(sysctl -n net.core.rmem_max 2>/dev/null || echo 0) / 1048576 ))
@@ -2840,13 +3080,15 @@ show_status() {
     node_p=$(get_saved_node_port)
     caddy_p=$(get_saved_caddy_port)
     caddy_dom=$(get_saved_caddy_domain)
+    xhttp_dom=$(get_saved_xhttp_domain)
 
     box_top "СОСТОЯНИЕ УЗЛА И СЕТЕВОГО СТЕКА"
     box_kv "ОС / Ядро" "${OS} ($(uname -r))"
     box_kv "TCP Congestion" "${cc} + ${qdisc} (rmem_max: ${rmem_mb} MB)"
     box_kv "SSH порт" "${ssh_p}/tcp"
     box_kv "IP Панели (UFW ACL)" "${panel_ip:-не привязан} -> порт ${node_p}/tcp"
-    box_kv "Caddy Selfsteal" "${caddy_dom:-не настроен} (127.0.0.1:${caddy_p})"
+    box_kv "Vision SNI (:10443)" "${caddy_dom:-не настроен} (Selfsteal 127.0.0.1:${caddy_p})"
+    box_kv "XHTTP SNI (:10444)" "${xhttp_dom:-не настроен} (path: ${XHTTP_PATH:-$DEFAULT_XHTTP_PATH})"
     box_bottom
     echo
 
@@ -2864,7 +3106,7 @@ show_status() {
     fi
 
     if is_caddy_running; then
-        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${CADDY_CONTAINER_NAME} (127.0.0.1:${caddy_p})"
+        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${CADDY_CONTAINER_NAME} (L4 :443 | Selfsteal 127.0.0.1:${caddy_p})"
     else
         box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер ${CADDY_CONTAINER_NAME}"
     fi
@@ -2888,10 +3130,11 @@ show_status() {
 
 show_installation_summary() {
     echo
-    box_top "ИТОГИ РАЗВЕРТЫВАНИЯ УЗЛА LISSVPN"
+    box_top "ИТОГИ РАЗВЕРТЫВАНИЯ УЗЛА LISSVPN (CADDY L4 MULTI-PROTOCOL)"
     box_kv "Сетевой стек Highload" "$STATUS_NETWORK"
     box_kv "Docker Engine" "$STATUS_DOCKER"
-    box_kv "Caddy Selfsteal" "$STATUS_CADDY ($(get_saved_caddy_domain) : $(get_saved_caddy_port))"
+    box_kv "Caddy L4 + Selfsteal" "$STATUS_CADDY (Vision: $(get_saved_caddy_domain) | XHTTP: $(get_saved_xhttp_domain))"
+    box_kv "L4 Маршрутизация :443" "Vision -> 127.0.0.1:${VISION_INBOUND_PORT} | XHTTP -> 127.0.0.1:${XHTTP_INBOUND_PORT}"
     box_kv "Remnawave API" "$STATUS_API ${DETAIL_NODE_UUID:+(Node UUID: $DETAIL_NODE_UUID)}"
     box_kv "RemnawaveNode" "$STATUS_REMNANODE (порт: $(get_saved_node_port), /certs:ro)"
     box_kv "UFW Firewall (ACL)" "$STATUS_UFW (панель: $(get_saved_panel_ip))"
@@ -2909,8 +3152,8 @@ update_components() {
         docker compose --project-directory "$REMNANODE_DIR" up -d --remove-orphans
     fi
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
-        log_info "Обновление образа Caddy Selfsteal..."
-        docker compose --project-directory "$CADDY_DIR" pull
+        log_info "Пересборка и обновление образа Caddy L4 Selfsteal..."
+        docker compose --project-directory "$CADDY_DIR" build --pull
         docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
     fi
     log_success "Все установленные компоненты обновлены."
@@ -2934,7 +3177,11 @@ REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 NODE_ADDRESS="${NODE_ADDRESS:-$NODE_IP}"
 SELF_STEAL_DOMAIN="$(get_saved_caddy_domain)"
+XHTTP_STEAL_DOMAIN="$(get_saved_xhttp_domain)"
+XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
+VISION_INBOUND_PORT=${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}
+XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}
 CFG_SECRET_KEY="${cfg_secret}"
 CFG_NODE_PORT=$(get_saved_node_port)
 CFG_PANEL_IP="$(get_saved_panel_ip)"
@@ -2979,7 +3226,7 @@ show_help() {
   Использование: node-mgr [КОМАНДА] [ОПЦИИ]
 
   Основные команды тулкита:
-    auto-deploy                  Полное авто-развертывание ноды, xhttp-профиля и хоста по API
+    auto-deploy                  Полное авто-развертывание ноды, L4-профиля (Reality+XHTTP) и 2 хостов по API
     diagnose [-q|--no-net]       Диагностика ноды (27 чеков, дашборд, вердикт)
     optimize [--all|--from-findings|--zram|--sysctl|--rps|--nic|--mss]
                                  Тюнинг ядра, BBR, лимитов FD, RPS/RFS, NIC, TCPMSS, Zram
@@ -2990,18 +3237,20 @@ show_help() {
     install                      Установка ноды (с выбором API или ручного режима)
     selective                    Выборочная установка или починка отдельных модулей
     change-template              Смена HTML-шаблона маскировки (/opt/html)
-    update                       Обновление Docker-образов RemnaNode и Caddy
+    update                       Обновление Docker-образов RemnaNode и Caddy L4
     self-update                  Обновление самого скрипта node-mgr из GitHub
     export-config [FILE]         Экспорт текущих настроек в конфиг-файл
     uninstall                    Удаление всех компонентов и откат настроек
     --config FILE                Автоматическая установка по конфиг-файлу
 
-  Переменные окружения для Zero-Touch API деплоя:
+  Переменные окружения для Zero-Touch API деплоя (Caddy L4: Reality Vision + XHTTP):
     REMNAWAVE_API_URL="https://panel.example.com"
     REMNAWAVE_API_TOKEN="eyJ..."
-    NODE_NAME="DE-Frankfurt-01"
-    NODE_ADDRESS="84.54.57.173"
-    SELF_STEAL_DOMAIN="edge.example.com"
+    NODE_NAME="NL-Ruby-01"
+    NODE_ADDRESS="82.47.155.72"
+    SELF_STEAL_DOMAIN="nl1.example.com"
+    XHTTP_STEAL_DOMAIN="nl2.example.com"
+    XHTTP_PATH="/api/v3/sync/r1"
     SELF_STEAL_PORT="9443"
 HELP
     echo
@@ -3016,7 +3265,7 @@ show_main_menu() {
         echo
         echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Диагностика ноды${NC}     ${DIM}27 чеков, дашборд, аудит безопасности и вердикт${NC}"
         echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Оптимизация стека${NC}    ${DIM}sysctl / BBR / FD / RPS / NIC / TCPMSS / Zram${NC}"
-        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Авто-деплой по API${NC}   ${DIM}Нода + Профиль (xhttp) + Хост + Selfsteal + Certs${NC}"
+        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Авто-деплой по API${NC}   ${DIM}Caddy L4 + 2 Инбаунда (Reality + XHTTP) + 2 Хоста${NC}"
         echo -e "    ${ORANGE}${BOLD}[4]${NC} ${WHITE}Выборочный запуск${NC}    ${DIM}ручная установка или починка отдельных модулей${NC}"
         echo -e "    ${ORANGE}${BOLD}[5]${NC} ${WHITE}Статус системы${NC}       ${DIM}контейнеры, ядро, UFW ACL, наложенные артефакты${NC}"
         echo -e "    ${ORANGE}${BOLD}[6]${NC} ${WHITE}Ядро BBRv3 (XanMod)${NC}  ${DIM}установка ядра XanMod под микроархитектуру CPU${NC}"
