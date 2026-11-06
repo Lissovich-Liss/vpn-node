@@ -2253,51 +2253,122 @@ automate_remnawave_api() {
     DETAIL_PROFILE_UUID="$profile_uuid"
     log_success "Профиль активен: Profile UUID=${profile_uuid} | Inbound UUID=${inbound_uuid}"
 
-    # ── ШАГ 2: Создание или получение Ноды (/api/nodes) ─────────────────────
+    # ── ШАГ 2: Создание или получение Ноды (/api/nodes + /api/keygen) ───────
     log_info "Шаг 2/3: Регистрация ноды '${NODE_NAME}' (${NODE_ADDRESS})..."
     local req_node_port="${CFG_NODE_PORT:-3000}"
     local node_payload node_resp="" node_uuid="" node_secret="" parsed_port=""
 
-    node_payload=$(jq -n \
-        --arg name "$NODE_NAME" \
-        --arg addr "$NODE_ADDRESS" \
-        --argjson port "$req_node_port" \
-        --arg p_uuid "$profile_uuid" \
-        --arg i_uuid "$inbound_uuid" \
-        '{
-            name: $name,
-            address: $addr,
-            port: $port,
-            isTrafficTrackingActive: false,
-            configProfile: {
-                activeConfigProfileUuid: $p_uuid,
-                activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
-            }
-        }')
+    # 2.1 Проверяем, существует ли уже нода в GET /api/nodes
+    local all_nodes=""
+    all_nodes=$(remnawave_api_request "GET" "/api/nodes" "" 2>/dev/null || true)
+    if [ -n "$all_nodes" ]; then
+        node_uuid=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+            (.response.nodes // .response // .data.nodes // .data // [])
+            | if type == "array" then map(select(.address == $a or .name == $n))[0].uuid else empty end // empty
+        ' 2>/dev/null || true)
+        node_secret=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+            (.response.nodes // .response // .data.nodes // .data // [])
+            | if type == "array" then map(select(.address == $a or .name == $n))[0] | (.secretKey // .pubKey // .credentials.secretKey) else empty end // empty
+        ' 2>/dev/null || true)
+        parsed_port=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+            (.response.nodes // .response // .data.nodes // .data // [])
+            | if type == "array" then map(select(.address == $a or .name == $n))[0].port else empty end // empty
+        ' 2>/dev/null || true)
+    fi
 
-    if node_resp=$(remnawave_api_request "POST" "/api/nodes" "$node_payload" 2>/dev/null); then
-        node_uuid=$(echo "$node_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
-        node_secret=$(echo "$node_resp" | jq -r '.response.secretKey // .response.xrayVersion // .data.secretKey // .secretKey // empty')
-        parsed_port=$(echo "$node_resp" | jq -r '.response.port // .data.port // .port // empty')
+    # 2.2 Если нода ещё не создана — регистрируем через POST /api/nodes
+    if [ -z "$node_uuid" ]; then
+        node_payload=$(jq -n \
+            --arg name "$NODE_NAME" \
+            --arg addr "$NODE_ADDRESS" \
+            --argjson port "$req_node_port" \
+            --arg p_uuid "$profile_uuid" \
+            --arg i_uuid "$inbound_uuid" \
+            '{
+                name: $name,
+                address: $addr,
+                port: $port,
+                isTrafficTrackingActive: false,
+                configProfile: {
+                    activeConfigProfileUuid: $p_uuid,
+                    activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
+                }
+            }')
+
+        if node_resp=$(remnawave_api_request "POST" "/api/nodes" "$node_payload"); then
+            node_uuid=$(echo "$node_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty' 2>/dev/null || true)
+            node_secret=$(echo "$node_resp" | jq -r '.response.secretKey // .response.pubKey // .data.secretKey // .data.pubKey // .secretKey // .pubKey // empty' 2>/dev/null || true)
+            parsed_port=$(echo "$node_resp" | jq -r '.response.port // .data.port // .port // empty' 2>/dev/null || true)
+        else
+            log_error "Не удалось зарегистрировать ноду через POST /api/nodes!"
+            STATUS_API="ошибка"
+            return 1
+        fi
     else
-        log_info "Нода уже зарегистрирована, извлекаем данные из GET /api/nodes..."
-        local all_nodes=""
-        all_nodes=$(remnawave_api_request "GET" "/api/nodes" "" 2>/dev/null || true)
-        if [ -n "$all_nodes" ]; then
-            node_uuid=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
-                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].uuid // empty
-            ')
-            node_secret=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
-                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].secretKey // empty
-            ')
-            parsed_port=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
-                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].port // empty
-            ')
+        log_info "Найдена существующая нода '${NODE_NAME}' (UUID: ${node_uuid})"
+        # Обновляем привязку профиля и инбаунда у существующей ноды
+        local update_node_payload
+        update_node_payload=$(jq -n \
+            --arg uuid "$node_uuid" \
+            --arg p_uuid "$profile_uuid" \
+            --arg i_uuid "$inbound_uuid" \
+            '{
+                uuid: $uuid,
+                configProfile: {
+                    activeConfigProfileUuid: $p_uuid,
+                    activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
+                }
+            }')
+        remnawave_api_request "PATCH" "/api/nodes" "$update_node_payload" >/dev/null 2>&1 || true
+    fi
+
+    # 2.3 В Remnawave Panel SECRET_KEY (pubKey) выдаётся эндпоинтом GET /api/keygen
+    if [ -z "$node_secret" ] || [ "$node_secret" = "null" ]; then
+        local keygen_resp=""
+        keygen_resp=$(remnawave_api_request "GET" "/api/keygen" "" 2>/dev/null || true)
+        if [ -n "$keygen_resp" ]; then
+            node_secret=$(echo "$keygen_resp" | jq -r '
+                if (.response | type) == "string" then .response
+                elif (.data | type) == "string" then .data
+                else (.response.pubKey // .response.secretKey // .response.key // .data.pubKey // .data.secretKey // .pubKey // .secretKey // empty)
+                end
+            ' 2>/dev/null || true)
         fi
     fi
 
+    # 2.4 Fallback: проверяем GET /api/nodes/{uuid}, если ключ всё ещё не получен
+    if { [ -z "$node_secret" ] || [ "$node_secret" = "null" ]; } && [ -n "$node_uuid" ]; then
+        local single_node_resp=""
+        single_node_resp=$(remnawave_api_request "GET" "/api/nodes/${node_uuid}" "" 2>/dev/null || true)
+        if [ -n "$single_node_resp" ]; then
+            node_secret=$(echo "$single_node_resp" | jq -r '
+                .response.secretKey // .response.pubKey // .data.secretKey // .data.pubKey // .secretKey // .pubKey // empty
+            ' 2>/dev/null || true)
+        fi
+    fi
+
+    # Очищаем префиксы SECRET_KEY= / SSL_CERT= и пробельные символы, если API вернул строку формата KEY=VALUE
+    node_secret=$(echo "${node_secret:-}" | sed -E 's/^(SECRET_KEY|SSL_CERT)=//; s/^"//; s/"$//' | tr -d '\r\n ')
+    if [ "$node_secret" = "null" ]; then
+        node_secret=""
+    fi
+
+    # 2.5 Fallback на CFG_SECRET_KEY или ручной ввод в интерактивном режиме
+    if [ -z "$node_secret" ] && [ -n "${CFG_SECRET_KEY:-}" ]; then
+        node_secret="$CFG_SECRET_KEY"
+    fi
+
+    if [ -z "$node_secret" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
+        log_warning "API не вернул публичный ключ через /api/keygen. Вставьте SECRET_KEY из панели вручную:"
+        while IFS= read -r line; do
+            if [ -z "$line" ]; then break; fi
+            node_secret="${node_secret}${line}"
+        done
+        node_secret=$(echo "$node_secret" | sed -E 's/^(SECRET_KEY|SSL_CERT)=//; s/^"//; s/"$//' | tr -d '\r\n ')
+    fi
+
     if [ -z "$node_secret" ]; then
-        log_error "Не удалось извлечь secretKey ноды из ответа API!"
+        log_error "Не удалось извлечь secretKey ноды из ответа API (/api/keygen и /api/nodes)!"
         STATUS_API="ошибка"
         return 1
     fi
