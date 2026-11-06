@@ -2098,22 +2098,27 @@ collect_api_inputs() {
 automate_remnawave_api() {
     print_header "АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ В ПАНЕЛИ REMNAWAVE API"
 
+    # Режим безопасности для xhttp: "reality" (с fallback на Caddy) или "tls" (с прямым чтением сертификатов Let's Encrypt)
+    # По умолчанию создаем комбинированный конфиг или используем оба блока согласно схеме Remnawave
     local cert_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.crt"
     local key_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.key"
-    local inbound_tag="XHTTP-SELFSTEAL-${NODE_NAME//[^a-zA-Z0-9_-]/}"
-    local profile_name="Profile-${NODE_NAME}"
 
-    # Генерация ключей Reality и shortId на случай использования Reality-профиля
+    local clean_node_name="${NODE_NAME//[^a-zA-Z0-9_-]/}"
+    local profile_name="Profile-${clean_node_name}"
+    local inbound_tag="VLESS-XHTTP-${clean_node_name}"
+
+    # Генерация ключей Reality (X25519) и shortId
     local keypair priv_key pub_key short_id
     keypair=$(generate_x25519_keypair)
     priv_key="${keypair%%:*}"
     pub_key="${keypair##*:}"
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4e5f60718")
 
-    # ── 1. Создание или поиск Config Profile (Inbound xhttp + reality/certs) ──
-    log_info "Шаг 1/3: Создание Inbound-профиля (xhttp / reality) в панели..."
-    local profile_payload profile_resp profile_uuid="" inbound_uuid=""
+    # ── ШАГ 1: Создание или получение Config Profile (/api/config-profiles) ──
+    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}'..."
+    local profile_payload profile_resp="" profile_uuid="" inbound_uuid=""
 
+    # Формируем JSON строго по схеме POST /api/config-profiles панели Remnawave
     profile_payload=$(jq -n \
         --arg name "$profile_name" \
         --arg tag "$inbound_tag" \
@@ -2126,7 +2131,9 @@ automate_remnawave_api() {
         '{
             name: $name,
             config: {
-                log: { loglevel: "warning" },
+                log: {
+                    loglevel: "warning"
+                },
                 inbounds: [
                     {
                         tag: $tag,
@@ -2140,11 +2147,13 @@ automate_remnawave_api() {
                             network: "xhttp",
                             security: "reality",
                             xhttpSettings: {
+                                host: $dom,
                                 path: "/",
                                 mode: "auto"
                             },
                             tlsSettings: {
                                 serverName: $dom,
+                                alpn: ["h2", "http/1.1"],
                                 certificates: [
                                     {
                                         certificateFile: $cert,
@@ -2168,86 +2177,127 @@ automate_remnawave_api() {
                     }
                 ],
                 outbounds: [
-                    { tag: "DIRECT", protocol: "freedom" },
-                    { tag: "BLOCK", protocol: "blackhole" }
-                ]
+                    {
+                        tag: "DIRECT",
+                        protocol: "freedom",
+                        settings: {
+                            domainStrategy: "UseIPv4"
+                        }
+                    },
+                    {
+                        tag: "BLOCK",
+                        protocol: "blackhole"
+                    }
+                ],
+                routing: {
+                    domainStrategy: "IPIfNonMatch",
+                    rules: [
+                        {
+                            type: "field",
+                            ip: ["geoip:private"],
+                            outboundTag: "BLOCK"
+                        },
+                        {
+                            type: "field",
+                            protocol: ["bittorrent"],
+                            outboundTag: "BLOCK"
+                        }
+                    ]
+                }
             }
         }')
 
-    # Поддержка обоих стандартных эндпоинтов профилей Remnawave (/api/config-profiles и /api/inbounds)
-    if profile_resp=$(remnawave_api_request "POST" "/api/config-profiles" "$profile_payload" 2>/dev/null); then
-        profile_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
-        inbound_uuid=$(echo "$profile_resp" | jq -r '.response.inbounds[0].uuid // .data.inbounds[0].uuid // .inbounds[0].uuid // empty')
-    elif profile_resp=$(remnawave_api_request "POST" "/api/inbounds" "$profile_payload" 2>/dev/null); then
-        profile_uuid=$(echo "$profile_resp" | jq -r '.response.configProfileUuid // .response.uuid // .data.uuid // .uuid // .id // empty')
-        inbound_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
-    else
-        log_warning "Профиль с таким именем/тегом может уже существовать, проверяем список существующих..."
-        local existing_profiles
-        existing_profiles=$(remnawave_api_request "GET" "/api/config-profiles" "" 2>/dev/null || true)
-        if [ -n "$existing_profiles" ]; then
-            profile_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" '(.response.configProfiles // .response // .data // []) | map(select(.name == $n))[0].uuid // .[0].uuid // empty')
-            inbound_uuid=$(echo "$existing_profiles" | jq -r '(.response.configProfiles // .response // .data // [])[0].inbounds[0].uuid // empty')
+    # 1.1 Проверяем, существует ли уже профиль с именем $profile_name
+    local existing_profiles=""
+    existing_profiles=$(remnawave_api_request "GET" "/api/config-profiles" "" 2>/dev/null || true)
+    if [ -n "$existing_profiles" ]; then
+        profile_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" '
+            (.response.configProfiles // .response // .data // [])
+            | map(select(.name == $n))[0].uuid // empty
+        ' 2>/dev/null || true)
+
+        if [ -n "$profile_uuid" ]; then
+            inbound_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" --arg t "$inbound_tag" '
+                (.response.configProfiles // .response // .data // [])
+                | map(select(.name == $n))[0].inbounds
+                | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+            ' 2>/dev/null || true)
+            log_info "Найден существующий профиль '${profile_name}' (UUID: ${profile_uuid})"
         fi
     fi
 
-    if [ -n "$profile_uuid" ]; then
-        DETAIL_PROFILE_UUID="$profile_uuid"
-        log_success "Inbound-профиль готов (UUID: ${profile_uuid})"
-    else
-        log_warning "Не удалось получить UUID профиля автоматически, продолжаем создание ноды..."
+    # 1.2 Если профиль не найден — создаем новый через POST /api/config-profiles
+    if [ -z "$profile_uuid" ]; then
+        if profile_resp=$(remnawave_api_request "POST" "/api/config-profiles" "$profile_payload"); then
+            profile_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
+            inbound_uuid=$(echo "$profile_resp" | jq -r --arg t "$inbound_tag" '
+                (.response.inbounds // .data.inbounds // .inbounds // [])
+                | (map(select(.tag == $t))[0].uuid // .[0].uuid) // empty
+            ')
+        else
+            log_error "Не удалось создать Config Profile через POST /api/config-profiles!"
+            STATUS_API="ошибка"
+            return 1
+        fi
     fi
 
-    # ── 2. Создание Ноды (POST /api/nodes) ─────────────────────────
+    # 1.3 Если inbound_uuid всё ещё пуст, запрашиваем детали конкретного профиля по UUID
+    if [ -n "$profile_uuid" ] && [ -z "$inbound_uuid" ]; then
+        local single_prof=""
+        single_prof=$(remnawave_api_request "GET" "/api/config-profiles/${profile_uuid}" "" 2>/dev/null || true)
+        if [ -n "$single_prof" ]; then
+            inbound_uuid=$(echo "$single_prof" | jq -r '(.response.inbounds // .data.inbounds // [])[0].uuid // empty')
+        fi
+    fi
+
+    DETAIL_PROFILE_UUID="$profile_uuid"
+    log_success "Профиль активен: Profile UUID=${profile_uuid} | Inbound UUID=${inbound_uuid}"
+
+    # ── ШАГ 2: Создание или получение Ноды (/api/nodes) ─────────────────────
     log_info "Шаг 2/3: Регистрация ноды '${NODE_NAME}' (${NODE_ADDRESS})..."
     local req_node_port="${CFG_NODE_PORT:-3000}"
-    local node_payload node_resp node_uuid="" node_secret="" parsed_port=""
+    local node_payload node_resp="" node_uuid="" node_secret="" parsed_port=""
 
-    if [ -n "$profile_uuid" ] && [ -n "$inbound_uuid" ]; then
-        node_payload=$(jq -n \
-            --arg name "$NODE_NAME" \
-            --arg addr "$NODE_ADDRESS" \
-            --argjson port "$req_node_port" \
-            --arg p_uuid "$profile_uuid" \
-            --arg i_uuid "$inbound_uuid" \
-            '{
-                name: $name,
-                address: $addr,
-                port: $port,
-                configProfile: {
-                    activeConfigProfileUuid: $p_uuid,
-                    activeInbounds: [$i_uuid]
-                }
-            }')
-    else
-        node_payload=$(jq -n \
-            --arg name "$NODE_NAME" \
-            --arg addr "$NODE_ADDRESS" \
-            --argjson port "$req_node_port" \
-            '{
-                name: $name,
-                address: $addr,
-                port: $port
-            }')
-    fi
+    node_payload=$(jq -n \
+        --arg name "$NODE_NAME" \
+        --arg addr "$NODE_ADDRESS" \
+        --argjson port "$req_node_port" \
+        --arg p_uuid "$profile_uuid" \
+        --arg i_uuid "$inbound_uuid" \
+        '{
+            name: $name,
+            address: $addr,
+            port: $port,
+            isTrafficTrackingActive: false,
+            configProfile: {
+                activeConfigProfileUuid: $p_uuid,
+                activeInbounds: (if $i_uuid != "" then [$i_uuid] else [] end)
+            }
+        }')
 
-    if node_resp=$(remnawave_api_request "POST" "/api/nodes" "$node_payload"); then
-        node_uuid=$(echo "$node_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
-        node_secret=$(echo "$node_resp" | jq -r '.response.secretKey // .response.secret_key // .response.credentials.secretKey // .data.secretKey // .secretKey // .secret_key // empty')
+    if node_resp=$(remnawave_api_request "POST" "/api/nodes" "$node_payload" 2>/dev/null); then
+        node_uuid=$(echo "$node_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
+        node_secret=$(echo "$node_resp" | jq -r '.response.secretKey // .response.xrayVersion // .data.secretKey // .secretKey // empty')
         parsed_port=$(echo "$node_resp" | jq -r '.response.port // .data.port // .port // empty')
     else
-        log_warning "Нода '${NODE_NAME}' уже может существовать в панели, ищем по списку нод..."
-        local nodes_list
-        nodes_list=$(remnawave_api_request "GET" "/api/nodes" "" 2>/dev/null || true)
-        if [ -n "$nodes_list" ]; then
-            node_uuid=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].uuid // empty')
-            node_secret=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].secretKey // empty')
-            parsed_port=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].port // empty')
+        log_info "Нода уже зарегистрирована, извлекаем данные из GET /api/nodes..."
+        local all_nodes=""
+        all_nodes=$(remnawave_api_request "GET" "/api/nodes" "" 2>/dev/null || true)
+        if [ -n "$all_nodes" ]; then
+            node_uuid=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].uuid // empty
+            ')
+            node_secret=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].secretKey // empty
+            ')
+            parsed_port=$(echo "$all_nodes" | jq -r --arg a "$NODE_ADDRESS" --arg n "$NODE_NAME" '
+                (.response // .data // []) | map(select(.address == $a or .name == $n))[0].port // empty
+            ')
         fi
     fi
 
     if [ -z "$node_secret" ]; then
-        log_error "Не удалось получить SECRET_KEY из ответа API панели!"
+        log_error "Не удалось извлечь secretKey ноды из ответа API!"
         STATUS_API="ошибка"
         return 1
     fi
@@ -2256,11 +2306,11 @@ automate_remnawave_api() {
     CFG_NODE_PORT="${parsed_port:-$req_node_port}"
     DETAIL_REMNANODE_PORT="$CFG_NODE_PORT"
     DETAIL_NODE_UUID="$node_uuid"
-    log_success "Нода зарегистрирована! ID: ${node_uuid:-ok} | Порт: ${CFG_NODE_PORT}"
+    log_success "Нода синхронизирована: UUID=${node_uuid} | NODE_PORT=${CFG_NODE_PORT}"
 
-    # ── 3. Создание Хоста (POST /api/hosts) ────────────────────────
-    log_info "Шаг 3/3: Создание Хоста для домена ${SELF_STEAL_DOMAIN}..."
-    local host_payload host_resp host_uuid=""
+    # ── ШАГ 3: Создание Хоста (/api/hosts) ──────────────────────────────────
+    log_info "Шаг 3/3: Привязка Хоста (${SELF_STEAL_DOMAIN}:443) к Inbound..."
+    local host_payload host_resp="" host_uuid=""
 
     host_payload=$(jq -n \
         --arg remark "$NODE_NAME" \
@@ -2276,21 +2326,22 @@ automate_remnawave_api() {
             host: $addr,
             path: "/",
             securityLayer: "DEFAULT",
+            alpn: "h2,http/1.1",
+            fingerprint: "chrome",
             inbound: {
-                configProfileUuid: (if $p_uuid != "" then $p_uuid else null end),
-                configProfileInboundUuid: (if $i_uuid != "" then $i_uuid else null end)
+                configProfileUuid: $p_uuid,
+                configProfileInboundUuid: $i_uuid
             }
         }')
 
     if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$host_payload" 2>/dev/null); then
-        host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
+        host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
         DETAIL_HOST_UUID="$host_uuid"
-        log_success "Хост успешно создан в панели (UUID: ${host_uuid})"
+        log_success "Хост создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443)"
     else
-        log_warning "Хост не был создан автоматически (возможно, уже существует) — проверьте раздел Hosts в панели."
+        log_warning "Хост для ${SELF_STEAL_DOMAIN} уже существует или требует проверки в панели."
     fi
 
-    # Сохраняем метаданные API-деплоя
     umask 077
     cat > "$API_STATE_FILE" << EOF
 REMNAWAVE_API_URL="${REMNAWAVE_API_URL}"
@@ -2298,6 +2349,7 @@ NODE_NAME="${NODE_NAME}"
 NODE_ADDRESS="${NODE_ADDRESS}"
 NODE_UUID="${DETAIL_NODE_UUID}"
 PROFILE_UUID="${DETAIL_PROFILE_UUID}"
+INBOUND_UUID="${inbound_uuid}"
 HOST_UUID="${DETAIL_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT}"
