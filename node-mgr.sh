@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v3.3.1 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v3.4.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
-#  RemnawaveNode • Caddy Selfsteal • UFW (Strict Panel ACL) • Fail2ban
+#  Remnawave API Auto-Deploy • Caddy Selfsteal • UFW (Strict ACL) • Fail2ban
 #  Integrated 27-Point Node Diagnostic & Kernel/NIC/RPS/MSS/Zram Optimizer
 # ==============================================================================
 
 set -Eeuo pipefail
 
-# Настройка UTF-8 локали без побайтового разрыва символов
+# Принудительная UTF-8 локаль без побайтового разрыва символов
 if locale -a 2>/dev/null | grep -qiE '^C\.UTF-8$|^C\.utf8$'; then
     export LC_ALL=C.UTF-8 LANG=C.UTF-8
 elif locale -a 2>/dev/null | grep -qiE '^en_US\.UTF-8$|^en_US\.utf8$'; then
@@ -37,7 +37,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="3.3.1"
+readonly SCRIPT_VERSION="3.4.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -45,20 +45,19 @@ readonly INSTALL_LOG="/var/log/remnanode-install.log"
 readonly ND_STATE_DIR="/var/lib/node-mgr"
 readonly FINDINGS_FILE="${ND_STATE_DIR}/findings.env"
 readonly FIX_LOG="${ND_STATE_DIR}/applied-fixes.log"
+readonly API_STATE_FILE="${ND_STATE_DIR}/remnawave-api.env"
 readonly ND_DROPIN_PREFIX="99-lissvpn"
 readonly ND_BOX_W=68
 
 readonly INSTALL_DIR="/opt"
 readonly REMNANODE_DIR="${INSTALL_DIR}/remnanode"
 readonly REMNANODE_DATA_DIR="/var/lib/remnanode"
-readonly CADDY_DIR="${INSTALL_DIR}/caddy"
-readonly CADDY_HTML_DIR="${CADDY_DIR}/html"
-readonly CADDY_VERSION="2.10.2"
+readonly CADDY_DIR="${INSTALL_DIR}/selfsteel"
+readonly CADDY_HTML_DIR="${INSTALL_DIR}/html"
+readonly CADDY_CONTAINER_NAME="caddy-remnawave"
+readonly CADDY_DATA_VOL="selfsteel_caddy_data_selfsteal"
+readonly CADDY_CONFIG_VOL="selfsteel_caddy_config_selfsteal"
 readonly DEFAULT_PORT="9443"
-
-CADDY_IMAGE="caddy:${CADDY_VERSION}"
-USE_WILDCARD=false
-CLOUDFLARE_API_TOKEN=""
 
 mkdir -p "$(dirname "$INSTALL_LOG")" "$ND_STATE_DIR" 2>/dev/null || true
 if [ -f "$INSTALL_LOG" ] && [ "$(stat -c%s "$INSTALL_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
@@ -83,18 +82,25 @@ trap 'log_error "Сбой на строке $LINENO (код: $?). Команда
 trap '_cleanup_on_exit' EXIT
 
 # ═══════════════════════════════════════════════════════════════════
-#  Non-interactive переменные
+#  Переменные окружения и Non-interactive параметры
 # ═══════════════════════════════════════════════════════════════════
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/remnanode-install.conf}"
 
+# Переменные для API-автоматизации Remnawave
+REMNAWAVE_API_URL="${REMNAWAVE_API_URL:-}"
+REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN:-}"
+NODE_NAME="${NODE_NAME:-}"
+NODE_ADDRESS="${NODE_ADDRESS:-}"
+SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN:-}"
+SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
+
+# Классические CFG_* переменные (совместимость)
 CFG_SECRET_KEY="${CFG_SECRET_KEY:-}"
 CFG_NODE_PORT="${CFG_NODE_PORT:-3000}"
 CFG_PANEL_IP="${CFG_PANEL_IP:-}"
 CFG_INSTALL_XRAY="${CFG_INSTALL_XRAY:-y}"
 CFG_DOMAIN="${CFG_DOMAIN:-}"
-CFG_CERT_TYPE="${CFG_CERT_TYPE:-1}"
-CFG_CLOUDFLARE_TOKEN="${CFG_CLOUDFLARE_TOKEN:-}"
 CFG_CADDY_PORT="${CFG_CADDY_PORT:-$DEFAULT_PORT}"
 CFG_APPLY_NETWORK="${CFG_APPLY_NETWORK:-y}"
 CFG_SETUP_UFW="${CFG_SETUP_UFW:-y}"
@@ -102,8 +108,9 @@ CFG_INSTALL_FAIL2BAN="${CFG_INSTALL_FAIL2BAN:-y}"
 
 STATUS_NETWORK="пропущен"
 STATUS_DOCKER="пропущен"
-STATUS_REMNANODE="пропущен"
 STATUS_CADDY="пропущен"
+STATUS_API="пропущен"
+STATUS_REMNANODE="пропущен"
 STATUS_UFW="пропущен"
 STATUS_FAIL2BAN="пропущен"
 
@@ -111,12 +118,15 @@ DETAIL_REMNANODE_PORT=""
 DETAIL_PANEL_IP=""
 DETAIL_CADDY_DOMAIN=""
 DETAIL_CADDY_PORT=""
+DETAIL_NODE_UUID=""
+DETAIL_PROFILE_UUID=""
+DETAIL_HOST_UUID=""
 NODE_IP=""
 OS=""
 PKG_MANAGER=""
 
 # ═══════════════════════════════════════════════════════════════════
-#  UI-примитивы (прямой вывод в TTY без разрыва UTF-8 символов)
+#  UI-примитивы (прямой вывод в TTY)
 # ═══════════════════════════════════════════════════════════════════
 _write_log() {
     printf '[%s] %s\n' "$(date +'%H:%M:%S')" "$*" >> "$INSTALL_LOG" 2>/dev/null || true
@@ -229,6 +239,13 @@ is_container_running() {
     return 1
 }
 
+is_caddy_running() {
+    if is_container_running "$CADDY_CONTAINER_NAME" || is_container_running "caddy-selfsteal"; then
+        return 0
+    fi
+    return 1
+}
+
 check_container_health() {
     local cname="$1"
     local max_wait="${2:-30}"
@@ -291,10 +308,28 @@ validate_ip_or_cidr() {
     return 1
 }
 
+resolve_host_to_ip() {
+    local host="$1"
+    host=$(echo "$host" | sed -E 's|^https?://||; s|/.*$||; s|:.*$||')
+    if validate_ip_or_cidr "$host"; then
+        echo "$host"
+        return 0
+    fi
+    local resolved=""
+    resolved=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}' || true)
+    if [ -z "$resolved" ] && command -v dig >/dev/null 2>&1; then
+        resolved=$(dig +short "$host" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    fi
+    echo "$resolved"
+}
+
 get_saved_panel_ip() {
-    local pip="${CFG_PANEL_IP:-}"
+    local pip="${DETAIL_PANEL_IP:-${CFG_PANEL_IP:-}}"
     if [ -z "$pip" ] && [ -f "$REMNANODE_DIR/.env" ]; then
         pip=$(grep -E '^PANEL_IP=' "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    if [ -z "$pip" ] && [ -f "$API_STATE_FILE" ]; then
+        pip=$(grep -E '^PANEL_IP=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
     echo "$pip"
 }
@@ -304,6 +339,9 @@ get_saved_node_port() {
     if [ -z "$nport" ] && [ -f "$REMNANODE_DIR/.env" ]; then
         nport=$(grep -E '^NODE_PORT=' "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
+    if [ -z "$nport" ] && [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        nport=$(grep -E 'NODE_PORT=' "$REMNANODE_DIR/docker-compose.yml" 2>/dev/null | head -1 | sed -E 's/.*NODE_PORT=([0-9]+).*/\1/' | tr -d '[:space:]"'\''' || true)
+    fi
     echo "${nport:-3000}"
 }
 
@@ -312,6 +350,9 @@ get_saved_caddy_port() {
     if [ -z "$cport" ] && [ -f "$CADDY_DIR/.env" ]; then
         cport=$(grep -E '^SELF_STEAL_PORT=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
+    if [ -z "$cport" ] && [ -f "/opt/caddy/.env" ]; then
+        cport=$(grep -E '^SELF_STEAL_PORT=' "/opt/caddy/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
     echo "${cport:-$DEFAULT_PORT}"
 }
 
@@ -319,6 +360,9 @@ get_saved_caddy_domain() {
     local cdom="${DETAIL_CADDY_DOMAIN:-}"
     if [ -z "$cdom" ] && [ -f "$CADDY_DIR/.env" ]; then
         cdom=$(grep -E '^SELF_STEAL_DOMAIN=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    if [ -z "$cdom" ] && [ -f "/opt/caddy/.env" ]; then
+        cdom=$(grep -E '^SELF_STEAL_DOMAIN=' "/opt/caddy/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
     echo "$cdom"
 }
@@ -559,7 +603,7 @@ install_package() {
 }
 
 install_base_utilities() {
-    log_info "Проверка и установка базовых системных утилит..."
+    log_info "Проверка и установка базовых системных утилит (curl, jq, openssl, ethtool)..."
     local -a required=("curl" "wget" "openssl" "tar" "jq" "ethtool" "iproute2" "ca-certificates")
     for pkg in "${required[@]}"; do
         local bin="$pkg"
@@ -601,7 +645,7 @@ load_config_file() {
     local config_file="${1:-$CONFIG_FILE}"
     if [ -f "$config_file" ]; then
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN SELF_STEAL_PORT CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -878,7 +922,7 @@ EOF
         _chk_fail "20. Контейнер RemnawaveNode" "Не установлен или остановлен"
     fi
 
-    if is_container_running "caddy-selfsteal"; then
+    if is_caddy_running; then
         _chk_ok "21. Контейнер Caddy Selfsteal" "Запущен (домен: ${caddy_domain:-?})"
     else
         _chk_fail "21. Контейнер Caddy Selfsteal" "Не установлен или остановлен"
@@ -892,10 +936,12 @@ EOF
         _chk_warn "22. Изоляция Selfsteal сокета" "Порт 127.0.0.1:${caddy_port} не прослушивается"
     fi
 
-    if is_container_running "caddy-selfsteal" && [ -n "$caddy_domain" ]; then
+    if is_caddy_running && [ -n "$caddy_domain" ]; then
         local clean_dom="${caddy_domain#\*.}"
+        local active_cname="$CADDY_CONTAINER_NAME"
+        if ! is_container_running "$active_cname"; then active_cname="caddy-selfsteal"; fi
         local cert_end=""
-        cert_end=$(docker exec caddy-selfsteal sh -c "find /data/caddy/certificates -type f -name '*${clean_dom}*.crt' 2>/dev/null | head -1" 2>/dev/null || true)
+        cert_end=$(docker exec "$active_cname" sh -c "find /data/caddy/certificates -type f -name '*${clean_dom}*.crt' 2>/dev/null | head -1" 2>/dev/null || true)
         if [ -n "$cert_end" ]; then
             _chk_ok "23. TLS-сертификат маскировки" "Выпущен (${clean_dom})"
         else
@@ -1433,7 +1479,7 @@ run_bbr3_xanmod() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  МОДУЛЬ 3: УСТАНОВКА DOCKER, REMNANODE И CADDY SELFSTEAL
+#  МОДУЛЬ 3: DOCKER, CADDY (/opt/selfsteel), REMNAWAVE API & REMNANODE
 # ═══════════════════════════════════════════════════════════════════
 install_docker() {
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -1472,6 +1518,13 @@ check_docker_compose() {
 
 check_existing_remnanode() {
     if [ -d "$REMNANODE_DIR" ] && [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        return 0
+    fi
+    return 1
+}
+
+check_existing_caddy() {
+    if [ -d "$CADDY_DIR" ] && [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         return 0
     fi
     return 1
@@ -1521,10 +1574,366 @@ install_xray_core() {
     return 0
 }
 
-install_remnanode() {
-    print_header "УСТАНОВКА И НАСТРОЙКА REMNANODE"
+# Генерация пары ключей X25519 (Private / Public) для Reality
+generate_x25519_keypair() {
+    local out=""
+    if [ -x "$REMNANODE_DATA_DIR/xray" ]; then
+        out=$("$REMNANODE_DATA_DIR/xray" x25519 2>/dev/null || true)
+    fi
+    if [ -z "$out" ] && command -v docker >/dev/null 2>&1; then
+        out=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>/dev/null || true)
+    fi
+    local priv pub
+    priv=$(echo "$out" | awk -F': ' '/Private key|PrivateKey/ {print $2; exit}' | tr -d '[:space:]')
+    pub=$(echo "$out" | awk -F': ' '/Public key|PublicKey|Password/ {print $2; exit}' | tr -d '[:space:]')
 
-    if check_existing_remnanode; then
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        # Fallback генерация через openssl x25519
+        local pem
+        pem=$(openssl genpkey -algorithm X25519 2>/dev/null || true)
+        if [ -n "$pem" ]; then
+            priv=$(echo "$pem" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+            pub=$(echo "$pem" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+    echo "${priv}:${pub}"
+}
+
+# ── Шаблоны маскировки в /opt/html ────────────────────────────────
+TEMPLATES=(
+    "10gag:Сайт мемов (10gag)"
+    "503-1:Техническая страница 503 (v1)"
+    "503-2:Техническая страница 503 (v2)"
+    "convertit:Конвертер документов (Convertit)"
+    "converter:Студия медиа-конвертации"
+    "downloader:Загрузчик файлов"
+    "filecloud:Облачное хранилище (FileCloud)"
+    "games-site:Игровой ретро-портал"
+    "modmanager:Менеджер модификаций"
+    "speedtest:Измеритель скорости сети"
+    "YouTube:Видео-шлюз с проверкой"
+)
+
+inject_antifingerprint_hash() {
+    local target_html="$CADDY_HTML_DIR/index.html"
+    if [ -f "$target_html" ]; then
+        local fp_hash
+        fp_hash=$(openssl rand -hex 6 2>/dev/null || echo "8a4f1c9e2b01")
+        sed -i "s/<html/<html data-edge-rev=\"${fp_hash}\"/I" "$target_html" 2>/dev/null || true
+        echo "<!-- edge-node-signature: ${fp_hash} -->" >> "$target_html"
+        log_success "Внедрена уникальная anti-fingerprint сигнатура: ${fp_hash}"
+    fi
+}
+
+create_default_fallback_html() {
+    mkdir -p "$CADDY_HTML_DIR"
+    cat > "$CADDY_HTML_DIR/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Edge AST Schema Gateway</title>
+<style>body{background:#151419;color:#fbfbfb;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.box{border:1px solid #2b2933;padding:2rem 2.5rem;border-radius:10px;max-width:460px;text-align:center}.tag{color:#F56E0F;font-family:monospace;font-size:.85rem;margin-top:1rem}</style>
+</head>
+<body><div class="box"><h3>Edge Gateway Ready</h3><p>Deterministic payload inspection endpoint is active.</p><div class="tag">status: operational</div></div></body>
+</html>
+EOF
+    inject_antifingerprint_hash
+}
+
+download_template() {
+    local template_folder="$1"
+    local template_label="${2:-$1}"
+    log_info "Установка шаблона маскировки в ${CADDY_HTML_DIR}: ${template_label}..."
+
+    mkdir -p "$CADDY_HTML_DIR"
+    find "${CADDY_HTML_DIR:?}" -mindepth 1 -delete 2>/dev/null || true
+
+    local base_url="https://raw.githubusercontent.com/Case211/remnanode-install/main/sni-templates/$template_folder"
+    if curl -fsSL --connect-timeout 8 "$base_url/index.html" -o "$CADDY_HTML_DIR/index.html" 2>/dev/null; then
+        curl -fsSL --connect-timeout 5 "$base_url/favicon.ico" -o "$CADDY_HTML_DIR/favicon.ico" 2>/dev/null || true
+        inject_antifingerprint_hash
+    else
+        create_default_fallback_html
+    fi
+}
+
+select_and_download_template() {
+    echo -e "  ${WHITE}Выберите HTML-шаблон для маскировки Reality (${CADDY_HTML_DIR}):${NC}"
+    local i=1
+    for entry in "${TEMPLATES[@]}"; do
+        printf "    ${ORANGE}%2d)${NC} %s\n" "$i" "${entry#*:}"
+        i=$((i + 1))
+    done
+    printf "    ${ORANGE}%2d)${NC} ${YELLOW}Случайный шаблон${NC}\n" "$i"
+    echo
+
+    local tmpl_choice="$i"
+    if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        prompt_choice "Номер шаблона [1-$i]: " "$i" tmpl_choice "$i"
+    fi
+
+    local entry
+    if [ "$tmpl_choice" -eq "$i" ]; then
+        entry="${TEMPLATES[$RANDOM % ${#TEMPLATES[@]}]}"
+    else
+        entry="${TEMPLATES[$((tmpl_choice - 1))]}"
+    fi
+    download_template "${entry%%:*}" "${entry#*:}"
+}
+
+# ── Ожидание выписки Let's Encrypt сертификата в томе Caddy ───────
+wait_for_caddy_certificate() {
+    local domain="$1"
+    local max_wait="${2:-90}"
+    local waited=0
+
+    log_info "Ожидание выпуска Let's Encrypt сертификата для ${domain} (до ${max_wait} сек)..."
+    while [ $waited -lt "$max_wait" ]; do
+        if is_container_running "$CADDY_CONTAINER_NAME"; then
+            local found_crt=""
+            found_crt=$(docker exec "$CADDY_CONTAINER_NAME" sh -c "find /data/caddy/certificates -type f -name '${domain}.crt' 2>/dev/null | head -1" 2>/dev/null || true)
+            if [ -n "$found_crt" ]; then
+                log_success "Сертификат Let's Encrypt успешно получен: ${found_crt}"
+                return 0
+            fi
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    log_warning "Таймаут ожидания сертификата (${max_wait}с). Убедитесь, что DNS A-запись ${domain} указывает на ${NODE_IP} и порт 80 открыт."
+    return 0
+}
+
+# ── Развертывание Caddy Selfsteal в /opt/selfsteel ────────────────
+install_caddy_selfsteal() {
+    print_header "РАЗВЕРТЫВАНИЕ CADDY SELFSTEAL (/opt/selfsteel)"
+
+    if check_existing_caddy && [ "${NON_INTERACTIVE:-false}" != true ]; then
+        log_warning "Caddy Selfsteal уже установлен в $CADDY_DIR"
+        echo -e "    ${ORANGE}1)${NC} Пропустить   ${ORANGE}2)${NC} Перезаписать (с бэкапом)"
+        local cc; prompt_choice "Выбор [1-2]: " 2 cc "1"
+        if [ "$cc" = "1" ]; then
+            STATUS_CADDY="уже установлен"
+            DETAIL_CADDY_DOMAIN=$(get_saved_caddy_domain)
+            DETAIL_CADDY_PORT=$(get_saved_caddy_port)
+            return 0
+        fi
+        backup_existing_config "$CADDY_DIR"
+        docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
+    fi
+
+    local domain="${SELF_STEAL_DOMAIN:-${CFG_DOMAIN:-}}"
+    if [ "${NON_INTERACTIVE:-false}" != true ] && [ -z "$domain" ]; then
+        while [ -z "$domain" ]; do
+            read -p "  ${ORANGE}>${NC} Домен для fallback/SNI (SELF_STEAL_DOMAIN): " -r domain
+            domain=$(echo "$domain" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+            if ! [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+                log_warning "Некорректный формат домена!"
+                domain=""
+            fi
+        done
+    fi
+    SELF_STEAL_DOMAIN="$domain"
+    DETAIL_CADDY_DOMAIN="$domain"
+
+    local port="${SELF_STEAL_PORT:-${CFG_CADDY_PORT:-$DEFAULT_PORT}}"
+    if [ "${NON_INTERACTIVE:-false}" != true ] && [ -z "${SELF_STEAL_PORT:-}" ]; then
+        while true; do
+            read -p "  ${ORANGE}>${NC} Внутренний порт fallback SELF_STEAL_PORT [${DEFAULT_PORT}]: " -r port
+            port="${port:-$DEFAULT_PORT}"
+            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] && [ "$port" -ne 443 ]; then
+                break
+            fi
+            log_warning "Укажите порт от 1024 до 65535 (кроме 443)."
+        done
+    fi
+    SELF_STEAL_PORT="$port"
+    DETAIL_CADDY_PORT="$port"
+
+    # 1. Создание /opt/html/index.html и директории /opt/selfsteel
+    mkdir -p "$CADDY_DIR" "$CADDY_HTML_DIR" "$CADDY_DIR/logs"
+    touch "$CADDY_DIR/logs/access.log"
+    chmod 644 "$CADDY_DIR/logs/access.log"
+
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        if [ ! -f "$CADDY_HTML_DIR/index.html" ]; then
+            download_template "filecloud" "FileCloud"
+        fi
+    else
+        select_and_download_template || create_default_fallback_html
+    fi
+
+    # 2. Генерация /opt/selfsteel/.env
+    umask 077
+    cat > "$CADDY_DIR/.env" << EOF
+SELF_STEAL_DOMAIN=${SELF_STEAL_DOMAIN}
+SELF_STEAL_PORT=${SELF_STEAL_PORT}
+EOF
+    chmod 600 "$CADDY_DIR/.env"
+    umask 022
+
+    # 3. Генерация /opt/selfsteel/Caddyfile (с поддержкой proxy_protocol + tls)
+    cat > "$CADDY_DIR/Caddyfile" << 'EOF'
+{
+    https_port {$SELF_STEAL_PORT}
+    default_bind 127.0.0.1
+    servers {
+        listener_wrappers {
+            proxy_protocol {
+                allow 127.0.0.1/32
+            }
+            tls
+        }
+    }
+    auto_https disable_redirects
+}
+
+http://{$SELF_STEAL_DOMAIN} {
+    bind 0.0.0.0
+    redir https://{$SELF_STEAL_DOMAIN}{uri} permanent
+}
+
+https://{$SELF_STEAL_DOMAIN} {
+    root * /var/www/html
+    try_files {path} /index.html
+    file_server
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MB
+            roll_keep 5
+        }
+        format json
+    }
+}
+
+:{$SELF_STEAL_PORT} {
+    tls internal
+    respond 204
+}
+
+:80 {
+    bind 0.0.0.0
+    respond 204
+}
+EOF
+
+    # 4. Генерация /opt/selfsteel/docker-compose.yml
+    cat > "$CADDY_DIR/docker-compose.yml" << 'EOF'
+services:
+  caddy:
+    image: caddy:latest
+    container_name: caddy-remnawave
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - /opt/html:/var/www/html
+      - ./logs:/var/log/caddy
+      - caddy_data_selfsteal:/data
+      - caddy_config_selfsteal:/config
+    env_file:
+      - .env
+    network_mode: "host"
+
+volumes:
+  caddy_data_selfsteal:
+    name: selfsteel_caddy_data_selfsteal
+  caddy_config_selfsteal:
+    name: selfsteel_caddy_config_selfsteal
+EOF
+
+    # 5. Запуск контейнера Caddy и ожидание сертификата
+    docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
+    docker compose --project-directory "$CADDY_DIR" pull --quiet 2>/dev/null || true
+    docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
+
+    if check_container_health "$CADDY_CONTAINER_NAME" 30; then
+        log_success "Контейнер ${CADDY_CONTAINER_NAME} запущен (127.0.0.1:${SELF_STEAL_PORT})"
+        wait_for_caddy_certificate "$SELF_STEAL_DOMAIN" 60
+        STATUS_CADDY="установлен"
+    else
+        log_error "Контейнер ${CADDY_CONTAINER_NAME} не запустился. Проверьте: node-mgr logs caddy"
+        STATUS_CADDY="ошибка"
+        return 1
+    fi
+}
+
+# ── Развертывание контейнера Remnanode с пробросом тома сертификатов ─
+deploy_remnanode_container() {
+    local node_port="$1"
+    local secret_key="$2"
+    local panel_ip="${3:-}"
+
+    mkdir -p "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" /var/log/remnanode
+    DETAIL_REMNANODE_PORT="$node_port"
+    if [ -n "$panel_ip" ]; then
+        DETAIL_PANEL_IP="$panel_ip"
+    fi
+
+    # Сохраняем .env для диагностики и UFW ACL
+    umask 077
+    cat > "$REMNANODE_DIR/.env" << EOF
+NODE_PORT=${node_port}
+PANEL_IP=${panel_ip}
+SECRET_KEY=${secret_key}
+EOF
+    chmod 600 "$REMNANODE_DIR/.env"
+    umask 022
+
+    # Убеждаемся, что внешний том сертификатов существует
+    if ! docker volume inspect "$CADDY_DATA_VOL" >/dev/null 2>&1; then
+        docker volume create "$CADDY_DATA_VOL" >/dev/null 2>&1 || true
+    fi
+
+    # Генерация /opt/remnanode/docker-compose.yml по спецификации
+    cat > "$REMNANODE_DIR/docker-compose.yml" << EOF
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=${node_port}
+      - SECRET_KEY=${secret_key}
+    volumes:
+      - ${CADDY_DATA_VOL}:/certs:ro
+      - /var/log/remnanode:/var/log/remnanode
+      - /dev/shm:/dev/shm
+
+volumes:
+  ${CADDY_DATA_VOL}:
+    external: true
+EOF
+
+    setup_logrotate
+    docker rm -f remnanode 2>/dev/null || true
+    docker compose --project-directory "$REMNANODE_DIR" pull --quiet 2>/dev/null || true
+    docker compose --project-directory "$REMNANODE_DIR" up -d --remove-orphans
+
+    if check_container_health "remnanode" 30; then
+        log_success "Контейнер remnanode успешно запущен (порт: ${node_port}, том сертификатов: /certs:ro)"
+        STATUS_REMNANODE="установлен"
+        return 0
+    else
+        log_error "Контейнер remnanode не вышел в статус Up"
+        STATUS_REMNANODE="ошибка"
+        return 1
+    fi
+}
+
+# ── Ручная установка Remnanode (если API-токен не используется) ───
+install_remnanode_manual() {
+    print_header "РУЧНАЯ УСТАНОВКА REMNANODE (/opt/remnanode)"
+
+    if check_existing_remnanode && [ "${NON_INTERACTIVE:-false}" != true ]; then
         log_warning "RemnawaveNode уже установлен в $REMNANODE_DIR"
         echo -e "    ${ORANGE}1)${NC} Пропустить   ${ORANGE}2)${NC} Перезаписать (с бэкапом)"
         local rc; prompt_choice "Выбор [1-2]: " 2 rc "1"
@@ -1537,8 +1946,6 @@ install_remnanode() {
         backup_existing_config "$REMNANODE_DIR"
         docker compose --project-directory "$REMNANODE_DIR" down 2>/dev/null || true
     fi
-
-    mkdir -p "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" /var/log/remnanode
 
     local SECRET_KEY_VALUE=""
     if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_SECRET_KEY" ]; then
@@ -1567,7 +1974,6 @@ install_remnanode() {
             log_warning "Порт должен быть числом от 1 до 65535."
         done
     fi
-    DETAIL_REMNANODE_PORT="$NODE_PORT"
 
     local PANEL_IP_VALUE="${CFG_PANEL_IP:-}"
     if [ "${NON_INTERACTIVE:-false}" != true ] || [ -z "$PANEL_IP_VALUE" ]; then
@@ -1577,394 +1983,339 @@ install_remnanode() {
             PANEL_IP_VALUE="${PANEL_IP_VALUE:-$current_pip}"
             PANEL_IP_VALUE=$(echo "$PANEL_IP_VALUE" | tr -d '[:space:]')
             if ! validate_ip_or_cidr "$PANEL_IP_VALUE"; then
-                log_warning "Введите корректный IPv4-адрес панели (каждый октет 0-255)!"
+                log_warning "Введите корректный IPv4-адрес панели!"
                 PANEL_IP_VALUE=""
             fi
         done
     fi
-    DETAIL_PANEL_IP="$PANEL_IP_VALUE"
-    CFG_PANEL_IP="$PANEL_IP_VALUE"
 
-    local has_host_xray=false
-    if install_xray_core; then
-        has_host_xray=true
-    fi
-
-    umask 077
-    cat > "$REMNANODE_DIR/.env" << EOF
-NODE_PORT=$NODE_PORT
-PANEL_IP=$PANEL_IP_VALUE
-SECRET_KEY=$SECRET_KEY_VALUE
-EOF
-    chmod 600 "$REMNANODE_DIR/.env"
-    umask 022
-
-    cat > "$REMNANODE_DIR/docker-compose.yml" << EOF
-services:
-  remnanode:
-    container_name: remnanode
-    hostname: remnanode
-    image: ghcr.io/remnawave/node:latest
-    env_file:
-      - .env
-    network_mode: host
-    restart: always
-    cap_add:
-      - NET_ADMIN
-    ulimits:
-      nofile:
-        soft: 1048576
-        hard: 1048576
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
-    volumes:
-      - /var/log/remnanode:/var/log/remnanode
-      - /dev/shm:/dev/shm
-EOF
-
-    if [ "$has_host_xray" = true ] && [ -f "$REMNANODE_DATA_DIR/xray" ]; then
-        echo "      - $REMNANODE_DATA_DIR/xray:/usr/local/bin/xray" >> "$REMNANODE_DIR/docker-compose.yml"
-        if [ -f "$REMNANODE_DATA_DIR/geoip.dat" ]; then
-            echo "      - $REMNANODE_DATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat" >> "$REMNANODE_DIR/docker-compose.yml"
-        fi
-        if [ -f "$REMNANODE_DATA_DIR/geosite.dat" ]; then
-            echo "      - $REMNANODE_DATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat" >> "$REMNANODE_DIR/docker-compose.yml"
-        fi
-    fi
-
-    setup_logrotate
-    docker rm -f remnanode 2>/dev/null || true
-    docker compose --project-directory "$REMNANODE_DIR" pull --quiet 2>/dev/null || true
-    docker compose --project-directory "$REMNANODE_DIR" up -d --remove-orphans
-
-    if check_container_health "remnanode" 30; then
-        log_success "Контейнер remnanode успешно запущен (порт: $NODE_PORT)"
-        STATUS_REMNANODE="установлен"
-    else
-        log_error "Контейнер remnanode не вышел в статус Up"
-        STATUS_REMNANODE="ошибка"
-    fi
+    deploy_remnanode_container "$NODE_PORT" "$SECRET_KEY_VALUE" "$PANEL_IP_VALUE"
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  Caddy Selfsteal + 11 SNI шаблонов + Anti-Fingerprint
+#  АВТОМАТИЗАЦИЯ ЧЕРЕЗ REMNAWAVE API (cURL + jq)
 # ═══════════════════════════════════════════════════════════════════
-TEMPLATES=(
-    "10gag:Сайт мемов (10gag)"
-    "503-1:Техническая страница 503 (v1)"
-    "503-2:Техническая страница 503 (v2)"
-    "convertit:Конвертер документов (Convertit)"
-    "converter:Студия медиа-конвертации"
-    "downloader:Загрузчик файлов"
-    "filecloud:Облачное хранилище (FileCloud)"
-    "games-site:Игровой ретро-портал"
-    "modmanager:Менеджер модификаций"
-    "speedtest:Измеритель скорости сети"
-    "YouTube:Видео-шлюз с проверкой"
-)
+remnawave_api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local payload="${3:-}"
+    local base_url="${REMNAWAVE_API_URL%/}"
+    local url="${base_url}${endpoint}"
 
-check_existing_caddy() {
-    if [ -d "$CADDY_DIR" ] && [ -f "$CADDY_DIR/docker-compose.yml" ]; then
-        return 0
-    fi
-    return 1
-}
+    local resp_file http_code
+    resp_file=$(create_temp_file)
 
-inject_antifingerprint_hash() {
-    local target_html="$CADDY_HTML_DIR/index.html"
-    if [ -f "$target_html" ]; then
-        local fp_hash
-        fp_hash=$(openssl rand -hex 6 2>/dev/null || echo "8a4f1c9e2b01")
-        sed -i "s/<html/<html data-edge-rev=\"${fp_hash}\"/I" "$target_html" 2>/dev/null || true
-        echo "<!-- edge-node-signature: ${fp_hash} -->" >> "$target_html"
-        log_success "Внедрена уникальная anti-fingerprint сигнатура: ${fp_hash}"
-    fi
-}
-
-download_template() {
-    local template_folder="$1"
-    local template_label="${2:-$1}"
-    log_info "Установка шаблона маскировки: ${template_label}..."
-
-    mkdir -p "$CADDY_HTML_DIR"
-    find "${CADDY_HTML_DIR:?}" -mindepth 1 -delete 2>/dev/null || true
-
-    local base_url="https://raw.githubusercontent.com/Case211/remnanode-install/main/sni-templates/$template_folder"
-    if curl -fsSL --connect-timeout 8 "$base_url/index.html" -o "$CADDY_HTML_DIR/index.html" 2>/dev/null; then
-        curl -fsSL --connect-timeout 5 "$base_url/favicon.ico" -o "$CADDY_HTML_DIR/favicon.ico" 2>/dev/null || true
+    if [ -n "$payload" ]; then
+        http_code=$(curl -sS -w "%{http_code}" -o "$resp_file" \
+            -X "$method" "$url" \
+            -H "Authorization: Bearer ${REMNAWAVE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            --connect-timeout 10 --max-time 25 \
+            -d "$payload" 2>/dev/null || echo "000")
     else
-        cat > "$CADDY_HTML_DIR/index.html" << 'EOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Edge AST Schema Gateway</title>
-<style>body{background:#151419;color:#fbfbfb;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.box{border:1px solid #2b2933;padding:2rem 2.5rem;border-radius:10px;max-width:460px;text-align:center}.tag{color:#F56E0F;font-family:monospace;font-size:.85rem;margin-top:1rem}</style>
-</head>
-<body><div class="box"><h3>Edge Gateway Ready</h3><p>Deterministic payload inspection endpoint is active.</p><div class="tag">status: operational</div></div></body>
-</html>
-EOF
-    fi
-    inject_antifingerprint_hash
-}
-
-select_and_download_template() {
-    echo -e "  ${WHITE}Выберите HTML-шаблон для маскировки Reality:${NC}"
-    local i=1
-    for entry in "${TEMPLATES[@]}"; do
-        printf "    ${ORANGE}%2d)${NC} %s\n" "$i" "${entry#*:}"
-        i=$((i + 1))
-    done
-    printf "    ${ORANGE}%2d)${NC} ${YELLOW}Случайный шаблон${NC}\n" "$i"
-    echo
-
-    local tmpl_choice="$i"
-    if [ "${NON_INTERACTIVE:-false}" != true ]; then
-        prompt_choice "Номер шаблона [1-$i]: " "$i" tmpl_choice "$i"
+        http_code=$(curl -sS -w "%{http_code}" -o "$resp_file" \
+            -X "$method" "$url" \
+            -H "Authorization: Bearer ${REMNAWAVE_API_TOKEN}" \
+            -H "Accept: application/json" \
+            --connect-timeout 10 --max-time 25 2>/dev/null || echo "000")
     fi
 
-    local entry
-    if [ "$tmpl_choice" -eq "$i" ]; then
-        entry="${TEMPLATES[$RANDOM % ${#TEMPLATES[@]}]}"
-    else
-        entry="${TEMPLATES[$((tmpl_choice - 1))]}"
-    fi
-    download_template "${entry%%:*}" "${entry#*:}"
-}
-
-validate_cloudflare_token() {
-    local token="$1"
-    local resp
-    resp=$(curl -s --connect-timeout 8 --max-time 12 -H "Authorization: Bearer $token" "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || true
-    if echo "$resp" | grep -q '"success":true'; then
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        cat "$resp_file"
         return 0
     else
+        log_error "API ${method} ${endpoint} вернул HTTP ${http_code}:"
+        cat "$resp_file" >&2 || true
+        echo >&2
         return 1
     fi
 }
 
-install_caddy_selfsteal() {
-    print_header "УСТАНОВКА CADDY SELFSTEAL (REALITY CAMOUFLAGE)"
+collect_api_inputs() {
+    print_header "ПАРАМЕТРЫ АВТОМАТИЗАЦИИ REMNAWAVE API"
 
-    if check_existing_caddy; then
-        log_warning "Caddy Selfsteal уже установлен в $CADDY_DIR"
-        echo -e "    ${ORANGE}1)${NC} Пропустить   ${ORANGE}2)${NC} Перезаписать (с бэкапом)"
-        local cc; prompt_choice "Выбор [1-2]: " 2 cc "1"
-        if [ "$cc" = "1" ]; then
-            STATUS_CADDY="уже установлен"
-            DETAIL_CADDY_DOMAIN=$(get_saved_caddy_domain)
-            DETAIL_CADDY_PORT=$(get_saved_caddy_port)
-            return 0
-        fi
-        backup_existing_config "$CADDY_DIR"
-        docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
-    fi
-
-    mkdir -p "$CADDY_DIR" "$CADDY_HTML_DIR" "$CADDY_DIR/logs"
-    touch "$CADDY_DIR/logs/access.log" "$CADDY_DIR/logs/default.log"
-    chmod 644 "$CADDY_DIR/logs/access.log" "$CADDY_DIR/logs/default.log"
-
-    local original_domain="${CFG_DOMAIN:-}"
-    if [ "${NON_INTERACTIVE:-false}" != true ] || [ -z "$original_domain" ]; then
-        while [ -z "$original_domain" ]; do
-            read -p "  ${ORANGE}>${NC} Домен маскировки (совпадает с serverNames в Xray): " -r original_domain
-            original_domain=$(echo "$original_domain" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
-            if ! [[ "$original_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
-                log_warning "Некорректный формат домена!"
-                original_domain=""
+    if [ -z "$REMNAWAVE_API_URL" ]; then
+        while [ -z "$REMNAWAVE_API_URL" ]; do
+            read -p "  ${ORANGE}>${NC} URL панели (REMNAWAVE_API_URL, напр. https://panel.example.com): " -r REMNAWAVE_API_URL
+            REMNAWAVE_API_URL=$(echo "$REMNAWAVE_API_URL" | tr -d '[:space:]' | sed 's|/$||')
+            if [[ ! "$REMNAWAVE_API_URL" =~ ^https?:// ]]; then
+                log_warning "URL должен начинаться с https:// или http://"
+                REMNAWAVE_API_URL=""
             fi
         done
     fi
-    DETAIL_CADDY_DOMAIN="$original_domain"
 
-    local cert_choice="${CFG_CERT_TYPE:-1}"
-    if [ "${NON_INTERACTIVE:-false}" != true ]; then
-        echo -e "  ${WHITE}Тип SSL-сертификата:${NC}"
-        echo -e "    ${ORANGE}1)${NC} Обычный HTTP-01 (Let's Encrypt, порт 80)"
-        echo -e "    ${ORANGE}2)${NC} Wildcard DNS-01 (Cloudflare API Token)"
-        prompt_choice "Выбор [1-2]: " 2 cert_choice "1"
-    fi
-
-    local domain="$original_domain"
-    local root_domain=""
-
-    if [ "$cert_choice" = "2" ]; then
-        USE_WILDCARD=true
-        CADDY_IMAGE="caddybuilds/caddy-cloudflare:latest"
-        CLOUDFLARE_API_TOKEN="${CFG_CLOUDFLARE_TOKEN:-}"
-        while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
-            read -s -p "  ${ORANGE}>${NC} Cloudflare API Token: " -r CLOUDFLARE_API_TOKEN
+    if [ -z "$REMNAWAVE_API_TOKEN" ]; then
+        while [ -z "$REMNAWAVE_API_TOKEN" ]; do
+            read -s -p "  ${ORANGE}>${NC} API Bearer токен (REMNAWAVE_API_TOKEN): " -r REMNAWAVE_API_TOKEN
             echo
-            CLOUDFLARE_API_TOKEN=$(echo "$CLOUDFLARE_API_TOKEN" | tr -d '\r\n ')
+            REMNAWAVE_API_TOKEN=$(echo "$REMNAWAVE_API_TOKEN" | tr -d '\r\n ')
         done
-        if validate_cloudflare_token "$CLOUDFLARE_API_TOKEN"; then
-            log_success "Cloudflare API Token проверен"
-        else
-            log_warning "Не удалось подтвердить токен через API Cloudflare"
+    fi
+
+    if [ -z "$NODE_NAME" ]; then
+        local def_name
+        def_name=$(hostname 2>/dev/null || echo "LissNode-01")
+        read -p "  ${ORANGE}>${NC} Имя новой ноды (NODE_NAME) [${def_name}]: " -r NODE_NAME
+        NODE_NAME="${NODE_NAME:-$def_name}"
+    fi
+
+    if [ -z "$NODE_ADDRESS" ]; then
+        read -p "  ${ORANGE}>${NC} Внешний IP или домен ноды (NODE_ADDRESS) [${NODE_IP}]: " -r NODE_ADDRESS
+        NODE_ADDRESS="${NODE_ADDRESS:-$NODE_IP}"
+    fi
+
+    if [ -z "$SELF_STEAL_DOMAIN" ]; then
+        while [ -z "$SELF_STEAL_DOMAIN" ]; do
+            read -p "  ${ORANGE}>${NC} Домен маскировки SNI (SELF_STEAL_DOMAIN): " -r SELF_STEAL_DOMAIN
+            SELF_STEAL_DOMAIN=$(echo "$SELF_STEAL_DOMAIN" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+        done
+    fi
+
+    if [ -z "${SELF_STEAL_PORT:-}" ]; then
+        SELF_STEAL_PORT="$DEFAULT_PORT"
+    fi
+
+    # Авто-резолв IP панели из REMNAWAVE_API_URL для UFW
+    if [ -z "${CFG_PANEL_IP:-}" ]; then
+        local resolved_pip
+        resolved_pip=$(resolve_host_to_ip "$REMNAWAVE_API_URL")
+        if [ -n "$resolved_pip" ] && validate_ip_or_cidr "$resolved_pip"; then
+            CFG_PANEL_IP="$resolved_pip"
+            DETAIL_PANEL_IP="$resolved_pip"
+            log_info "IP панели определен автоматически: ${ORANGE}${CFG_PANEL_IP}${NC}"
+        elif [ "${NON_INTERACTIVE:-false}" != true ]; then
+            while [ -z "$CFG_PANEL_IP" ]; do
+                read -p "  ${ORANGE}>${NC} Белый IP-адрес панели для UFW ACL: " -r CFG_PANEL_IP
+                if ! validate_ip_or_cidr "$CFG_PANEL_IP"; then CFG_PANEL_IP=""; fi
+            done
+            DETAIL_PANEL_IP="$CFG_PANEL_IP"
         fi
-        root_domain=$(echo "$original_domain" | sed 's/^[^.]*\.//')
-        domain="*.$root_domain"
+    fi
+}
+
+automate_remnawave_api() {
+    print_header "АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ В ПАНЕЛИ REMNAWAVE API"
+
+    local cert_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.crt"
+    local key_path="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${SELF_STEAL_DOMAIN}/${SELF_STEAL_DOMAIN}.key"
+    local inbound_tag="XHTTP-SELFSTEAL-${NODE_NAME//[^a-zA-Z0-9_-]/}"
+    local profile_name="Profile-${NODE_NAME}"
+
+    # Генерация ключей Reality и shortId на случай использования Reality-профиля
+    local keypair priv_key pub_key short_id
+    keypair=$(generate_x25519_keypair)
+    priv_key="${keypair%%:*}"
+    pub_key="${keypair##*:}"
+    short_id=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4e5f60718")
+
+    # ── 1. Создание или поиск Config Profile (Inbound xhttp + reality/certs) ──
+    log_info "Шаг 1/3: Создание Inbound-профиля (xhttp / reality) в панели..."
+    local profile_payload profile_resp profile_uuid="" inbound_uuid=""
+
+    profile_payload=$(jq -n \
+        --arg name "$profile_name" \
+        --arg tag "$inbound_tag" \
+        --arg dom "$SELF_STEAL_DOMAIN" \
+        --arg dest "127.0.0.1:${SELF_STEAL_PORT}" \
+        --arg cert "$cert_path" \
+        --arg key "$key_path" \
+        --arg pk "$priv_key" \
+        --arg sid "$short_id" \
+        '{
+            name: $name,
+            config: {
+                log: { loglevel: "warning" },
+                inbounds: [
+                    {
+                        tag: $tag,
+                        port: 443,
+                        protocol: "vless",
+                        settings: {
+                            clients: [],
+                            decryption: "none"
+                        },
+                        streamSettings: {
+                            network: "xhttp",
+                            security: "reality",
+                            xhttpSettings: {
+                                path: "/",
+                                mode: "auto"
+                            },
+                            tlsSettings: {
+                                serverName: $dom,
+                                certificates: [
+                                    {
+                                        certificateFile: $cert,
+                                        keyFile: $key
+                                    }
+                                ]
+                            },
+                            realitySettings: {
+                                show: false,
+                                dest: $dest,
+                                xver: 1,
+                                serverNames: [$dom],
+                                privateKey: $pk,
+                                shortIds: [$sid]
+                            }
+                        },
+                        sniffing: {
+                            enabled: true,
+                            destOverride: ["http", "tls", "quic"]
+                        }
+                    }
+                ],
+                outbounds: [
+                    { tag: "DIRECT", protocol: "freedom" },
+                    { tag: "BLOCK", protocol: "blackhole" }
+                ]
+            }
+        }')
+
+    # Поддержка обоих стандартных эндпоинтов профилей Remnawave (/api/config-profiles и /api/inbounds)
+    if profile_resp=$(remnawave_api_request "POST" "/api/config-profiles" "$profile_payload" 2>/dev/null); then
+        profile_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
+        inbound_uuid=$(echo "$profile_resp" | jq -r '.response.inbounds[0].uuid // .data.inbounds[0].uuid // .inbounds[0].uuid // empty')
+    elif profile_resp=$(remnawave_api_request "POST" "/api/inbounds" "$profile_payload" 2>/dev/null); then
+        profile_uuid=$(echo "$profile_resp" | jq -r '.response.configProfileUuid // .response.uuid // .data.uuid // .uuid // .id // empty')
+        inbound_uuid=$(echo "$profile_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
     else
-        USE_WILDCARD=false
-        CADDY_IMAGE="caddy:${CADDY_VERSION}"
+        log_warning "Профиль с таким именем/тегом может уже существовать, проверяем список существующих..."
+        local existing_profiles
+        existing_profiles=$(remnawave_api_request "GET" "/api/config-profiles" "" 2>/dev/null || true)
+        if [ -n "$existing_profiles" ]; then
+            profile_uuid=$(echo "$existing_profiles" | jq -r --arg n "$profile_name" '(.response.configProfiles // .response // .data // []) | map(select(.name == $n))[0].uuid // .[0].uuid // empty')
+            inbound_uuid=$(echo "$existing_profiles" | jq -r '(.response.configProfiles // .response // .data // [])[0].inbounds[0].uuid // empty')
+        fi
     fi
 
-    local port="${CFG_CADDY_PORT:-$DEFAULT_PORT}"
-    if [ "${NON_INTERACTIVE:-false}" != true ]; then
-        while true; do
-            read -p "  ${ORANGE}>${NC} Внутренний HTTPS порт Caddy [${DEFAULT_PORT}]: " -r port
-            port="${port:-$DEFAULT_PORT}"
-            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] && [ "$port" -ne 443 ]; then
-                break
-            fi
-            log_warning "Укажите порт от 1024 до 65535 (кроме 443)."
-        done
+    if [ -n "$profile_uuid" ]; then
+        DETAIL_PROFILE_UUID="$profile_uuid"
+        log_success "Inbound-профиль готов (UUID: ${profile_uuid})"
+    else
+        log_warning "Не удалось получить UUID профиля автоматически, продолжаем создание ноды..."
     fi
-    DETAIL_CADDY_PORT="$port"
 
+    # ── 2. Создание Ноды (POST /api/nodes) ─────────────────────────
+    log_info "Шаг 2/3: Регистрация ноды '${NODE_NAME}' (${NODE_ADDRESS})..."
+    local req_node_port="${CFG_NODE_PORT:-3000}"
+    local node_payload node_resp node_uuid="" node_secret="" parsed_port=""
+
+    if [ -n "$profile_uuid" ] && [ -n "$inbound_uuid" ]; then
+        node_payload=$(jq -n \
+            --arg name "$NODE_NAME" \
+            --arg addr "$NODE_ADDRESS" \
+            --argjson port "$req_node_port" \
+            --arg p_uuid "$profile_uuid" \
+            --arg i_uuid "$inbound_uuid" \
+            '{
+                name: $name,
+                address: $addr,
+                port: $port,
+                configProfile: {
+                    activeConfigProfileUuid: $p_uuid,
+                    activeInbounds: [$i_uuid]
+                }
+            }')
+    else
+        node_payload=$(jq -n \
+            --arg name "$NODE_NAME" \
+            --arg addr "$NODE_ADDRESS" \
+            --argjson port "$req_node_port" \
+            '{
+                name: $name,
+                address: $addr,
+                port: $port
+            }')
+    fi
+
+    if node_resp=$(remnawave_api_request "POST" "/api/nodes" "$node_payload"); then
+        node_uuid=$(echo "$node_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
+        node_secret=$(echo "$node_resp" | jq -r '.response.secretKey // .response.secret_key // .response.credentials.secretKey // .data.secretKey // .secretKey // .secret_key // empty')
+        parsed_port=$(echo "$node_resp" | jq -r '.response.port // .data.port // .port // empty')
+    else
+        log_warning "Нода '${NODE_NAME}' уже может существовать в панели, ищем по списку нод..."
+        local nodes_list
+        nodes_list=$(remnawave_api_request "GET" "/api/nodes" "" 2>/dev/null || true)
+        if [ -n "$nodes_list" ]; then
+            node_uuid=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].uuid // empty')
+            node_secret=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].secretKey // empty')
+            parsed_port=$(echo "$nodes_list" | jq -r --arg addr "$NODE_ADDRESS" --arg nm "$NODE_NAME" '(.response // .data // []) | map(select(.address == $addr or .name == $nm))[0].port // empty')
+        fi
+    fi
+
+    if [ -z "$node_secret" ]; then
+        log_error "Не удалось получить SECRET_KEY из ответа API панели!"
+        STATUS_API="ошибка"
+        return 1
+    fi
+
+    CFG_SECRET_KEY="$node_secret"
+    CFG_NODE_PORT="${parsed_port:-$req_node_port}"
+    DETAIL_REMNANODE_PORT="$CFG_NODE_PORT"
+    DETAIL_NODE_UUID="$node_uuid"
+    log_success "Нода зарегистрирована! ID: ${node_uuid:-ok} | Порт: ${CFG_NODE_PORT}"
+
+    # ── 3. Создание Хоста (POST /api/hosts) ────────────────────────
+    log_info "Шаг 3/3: Создание Хоста для домена ${SELF_STEAL_DOMAIN}..."
+    local host_payload host_resp host_uuid=""
+
+    host_payload=$(jq -n \
+        --arg remark "$NODE_NAME" \
+        --arg addr "$SELF_STEAL_DOMAIN" \
+        --arg sni "$SELF_STEAL_DOMAIN" \
+        --arg p_uuid "$profile_uuid" \
+        --arg i_uuid "$inbound_uuid" \
+        '{
+            remark: $remark,
+            address: $addr,
+            port: 443,
+            sni: $sni,
+            host: $addr,
+            path: "/",
+            securityLayer: "DEFAULT",
+            inbound: {
+                configProfileUuid: (if $p_uuid != "" then $p_uuid else null end),
+                configProfileInboundUuid: (if $i_uuid != "" then $i_uuid else null end)
+            }
+        }')
+
+    if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$host_payload" 2>/dev/null); then
+        host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // .id // empty')
+        DETAIL_HOST_UUID="$host_uuid"
+        log_success "Хост успешно создан в панели (UUID: ${host_uuid})"
+    else
+        log_warning "Хост не был создан автоматически (возможно, уже существует) — проверьте раздел Hosts в панели."
+    fi
+
+    # Сохраняем метаданные API-деплоя
     umask 077
-    cat > "$CADDY_DIR/.env" << EOF
-SELF_STEAL_DOMAIN=$domain
-SELF_STEAL_PORT=$port
+    cat > "$API_STATE_FILE" << EOF
+REMNAWAVE_API_URL="${REMNAWAVE_API_URL}"
+NODE_NAME="${NODE_NAME}"
+NODE_ADDRESS="${NODE_ADDRESS}"
+NODE_UUID="${DETAIL_NODE_UUID}"
+PROFILE_UUID="${DETAIL_PROFILE_UUID}"
+HOST_UUID="${DETAIL_HOST_UUID}"
+SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
+SELF_STEAL_PORT="${SELF_STEAL_PORT}"
+REALITY_PUBLIC_KEY="${pub_key}"
+REALITY_SHORT_ID="${short_id}"
+PANEL_IP="${CFG_PANEL_IP}"
 EOF
-    if [ "$USE_WILDCARD" = true ]; then
-        printf 'CLOUDFLARE_API_TOKEN=%s\n' "$CLOUDFLARE_API_TOKEN" >> "$CADDY_DIR/.env"
-    fi
-    chmod 600 "$CADDY_DIR/.env"
+    chmod 600 "$API_STATE_FILE"
     umask 022
 
-    cat > "$CADDY_DIR/docker-compose.yml" << EOF
-services:
-  caddy:
-    image: ${CADDY_IMAGE}
-    container_name: caddy-selfsteal
-    restart: unless-stopped
-    network_mode: "host"
-    env_file:
-      - .env
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - ${CADDY_HTML_DIR}:/var/www/html
-      - ./logs:/var/log/caddy
-      - caddy_data:/data
-      - caddy_config:/config
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-volumes:
-  caddy_data:
-    name: caddy_data
-  caddy_config:
-    name: caddy_config
-EOF
-
-    if [ "$USE_WILDCARD" = true ]; then
-        cat > "$CADDY_DIR/Caddyfile" << 'EOF'
-{
-	https_port {$SELF_STEAL_PORT}
-	default_bind 127.0.0.1
-	auto_https disable_redirects
-}
-
-:80 {
-	bind 0.0.0.0
-	redir https://{host}{uri} permanent
-}
-
-https://{$SELF_STEAL_DOMAIN} {
-	tls {
-		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-	}
-	root * /var/www/html
-	try_files {path} /index.html
-	file_server
-	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-		X-Content-Type-Options "nosniff"
-		-Server
-	}
-	log {
-		output file /var/log/caddy/access.log {
-			roll_size 10MB
-			roll_keep 5
-		}
-		format json
-	}
-}
-EOF
-    else
-        cat > "$CADDY_DIR/Caddyfile" << 'EOF'
-{
-	https_port {$SELF_STEAL_PORT}
-	default_bind 127.0.0.1
-	auto_https disable_redirects
-}
-
-http://{$SELF_STEAL_DOMAIN} {
-	bind 0.0.0.0
-	redir https://{host}{uri} permanent
-}
-
-https://{$SELF_STEAL_DOMAIN} {
-	tls {
-		issuer acme {
-			disable_tlsalpn_challenge
-		}
-	}
-	root * /var/www/html
-	try_files {path} /index.html
-	file_server
-	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-		X-Content-Type-Options "nosniff"
-		-Server
-	}
-	log {
-		output file /var/log/caddy/access.log {
-			roll_size 10MB
-			roll_keep 5
-		}
-		format json
-	}
-}
-
-:80 {
-	bind 0.0.0.0
-	respond 204
-	log off
-}
-EOF
-    fi
-
-    echo
-    select_and_download_template || true
-
-    docker rm -f caddy-selfsteal 2>/dev/null || true
-    docker compose --project-directory "$CADDY_DIR" pull --quiet 2>/dev/null || true
-    docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
-
-    if check_container_health "caddy-selfsteal" 30; then
-        log_success "Caddy Selfsteal запущен на 127.0.0.1:${port}"
-        STATUS_CADDY="установлен"
-    else
-        log_error "Caddy Selfsteal не запустился. Проверьте: node-mgr logs caddy"
-        STATUS_CADDY="ошибка"
-    fi
+    STATUS_API="выполнен"
+    return 0
 }
 
 change_template() {
     _init_env
-    if [ ! -d "$CADDY_HTML_DIR" ]; then
-        log_error "Caddy не установлен ($CADDY_HTML_DIR отсутствует)"
-        return 1
-    fi
-    print_header "СМЕНА HTML-ШАБЛОНА МАСКИРОВКИ"
+    mkdir -p "$CADDY_HTML_DIR"
+    print_header "СМЕНА HTML-ШАБЛОНА МАСКИРОВКИ (${CADDY_HTML_DIR})"
     select_and_download_template
     log_success "Шаблон обновлен на лету."
 }
@@ -2166,6 +2517,145 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  Сценарии развертывания: API Auto-Deploy и Интерактивная установка
+# ═══════════════════════════════════════════════════════════════════
+run_api_auto_deploy() {
+    _init_env
+    print_header "АВТОМАТИЧЕСКОЕ РАЗВЕРТЫВАНИЕ ЧЕРЕЗ REMNAWAVE API [1/7 .. 7/7]"
+
+    if ! check_disk_space 500 "/opt"; then
+        if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
+    fi
+
+    ensure_package_manager_available
+    _RESTORE_AUTO_UPDATES=true
+
+    echo -e "\n  ${ORANGE}${BOLD}[1/7] Проверка утилит (curl, jq, openssl, ethtool) и сбор параметров API${NC}"
+    install_base_utilities
+    collect_api_inputs
+
+    echo -e "\n  ${ORANGE}${BOLD}[2/7] Highload-оптимизация ядра, RPS, NIC и лимитов${NC}"
+    run_optimize "--all"
+
+    echo -e "\n  ${ORANGE}${BOLD}[3/7] Проверка и установка Docker Engine & Compose v2${NC}"
+    if install_docker && check_docker_compose; then
+        STATUS_DOCKER="установлен"
+    else
+        STATUS_DOCKER="ошибка"
+        exit 1
+    fi
+
+    echo -e "\n  ${ORANGE}${BOLD}[4/7] Развертывание Caddy Selfsteal (/opt/selfsteel) и выпуск SSL${NC}"
+    install_caddy_selfsteal
+
+    echo -e "\n  ${ORANGE}${BOLD}[5/7] Автоматическое создание Профиля, Ноды и Хоста через Remnawave API${NC}"
+    automate_remnawave_api
+
+    echo -e "\n  ${ORANGE}${BOLD}[6/7] Развертывание Remnanode (/opt/remnanode) с пробросом /certs:ro${NC}"
+    deploy_remnanode_container "$CFG_NODE_PORT" "$CFG_SECRET_KEY" "$CFG_PANEL_IP"
+
+    echo -e "\n  ${ORANGE}${BOLD}[7/7] Изоляция периметра UFW и запуск Fail2ban${NC}"
+    setup_ufw
+    install_fail2ban
+
+    restore_auto_updates
+    _RESTORE_AUTO_UPDATES=false
+    show_installation_summary
+}
+
+run_full_install() {
+    _init_env
+    if [ -n "${REMNAWAVE_API_TOKEN:-}" ] && [ -n "${REMNAWAVE_API_URL:-}" ]; then
+        run_api_auto_deploy
+        return 0
+    fi
+
+    print_header "ВЫБОР РЕЖИМА ПОЛНОЙ УСТАНОВКИ УЗЛА"
+    echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Автоматическая регистрация через Remnawave API${NC} ${DIM}(Нода + Профиль xhttp + Хост + Selfsteal)${NC}"
+    echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Ручная установка по готовому SECRET_KEY${NC}       ${DIM}(Классический режим)${NC}"
+    echo
+    local mode_c="1"
+    prompt_choice "Выберите режим [1-2, Enter=1]: " 2 mode_c "1"
+
+    if [ "$mode_c" = "1" ]; then
+        run_api_auto_deploy
+        return 0
+    fi
+
+    print_header "КЛАССИЧЕСКАЯ УСТАНОВКА УЗЛА [1/6 .. 6/6]"
+    if ! check_disk_space 500 "/opt"; then
+        if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
+    fi
+    ensure_package_manager_available
+    _RESTORE_AUTO_UPDATES=true
+    install_base_utilities
+
+    echo -e "\n  ${ORANGE}${BOLD}[1/6] Оптимизация ядра, RPS, NIC и лимитов${NC}"
+    run_optimize "--all"
+
+    echo -e "\n  ${ORANGE}${BOLD}[2/6] Установка Docker Engine${NC}"
+    if install_docker && check_docker_compose; then
+        STATUS_DOCKER="установлен"
+    else
+        STATUS_DOCKER="ошибка"
+        exit 1
+    fi
+
+    echo -e "\n  ${ORANGE}${BOLD}[3/6] Установка Caddy Selfsteal (/opt/selfsteel)${NC}"
+    install_caddy_selfsteal
+
+    echo -e "\n  ${ORANGE}${BOLD}[4/6] Установка RemnawaveNode (/opt/remnanode)${NC}"
+    install_remnanode_manual
+
+    echo -e "\n  ${ORANGE}${BOLD}[5/6] Настройка UFW Firewall (Strict Panel ACL)${NC}"
+    setup_ufw
+
+    echo -e "\n  ${ORANGE}${BOLD}[6/6] Установка и запуск Fail2ban${NC}"
+    install_fail2ban
+
+    restore_auto_updates
+    _RESTORE_AUTO_UPDATES=false
+    show_installation_summary
+}
+
+run_selective_install() {
+    _init_env
+    print_header "ВЫБОРОЧНАЯ УСТАНОВКА / ПОЧИНКА МОДУЛЕЙ"
+    echo -e "    ${ORANGE}${BOLD}[1]${NC} Оптимизация ядра (sysctl/BBR/FD/RPS/NIC/MSS/journald)"
+    echo -e "    ${ORANGE}${BOLD}[2]${NC} Docker Engine & Compose v2"
+    echo -e "    ${ORANGE}${BOLD}[3]${NC} Caddy Selfsteal (/opt/selfsteel + /opt/html)"
+    echo -e "    ${ORANGE}${BOLD}[4]${NC} Регистрация через Remnawave API + запуск Remnanode"
+    echo -e "    ${ORANGE}${BOLD}[5]${NC} Ручная установка Remnanode (по SECRET_KEY)"
+    echo -e "    ${ORANGE}${BOLD}[6]${NC} UFW Firewall (доступ к порту ноды только с IP панели)"
+    echo -e "    ${ORANGE}${BOLD}[7]${NC} Fail2ban (починка конфига и перезапуск)"
+    echo
+
+    local selection_raw
+    read -p "  ${ORANGE}>${NC} Номера через пробел [1-7]: " -r selection_raw
+    if [ -z "$selection_raw" ]; then return 0; fi
+
+    ensure_package_manager_available
+    _RESTORE_AUTO_UPDATES=true
+    install_base_utilities
+
+    for c in $selection_raw; do
+        case "$c" in
+            1) run_optimize "--all" ;;
+            2) if install_docker && check_docker_compose; then STATUS_DOCKER="установлен"; fi ;;
+            3) install_caddy_selfsteal ;;
+            4) collect_api_inputs && automate_remnawave_api && deploy_remnanode_container "$CFG_NODE_PORT" "$CFG_SECRET_KEY" "$CFG_PANEL_IP" ;;
+            5) install_remnanode_manual ;;
+            6) setup_ufw ;;
+            7) install_fail2ban ;;
+        esac
+    done
+
+    restore_auto_updates
+    _RESTORE_AUTO_UPDATES=false
+    show_installation_summary
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  Статус, Логи, Автообновление с GitHub, Удаление
 # ═══════════════════════════════════════════════════════════════════
 show_logs() {
@@ -2175,7 +2665,11 @@ show_logs() {
             docker logs -f --tail=100 remnanode
             ;;
         caddy|selfsteal)
-            docker logs -f --tail=100 caddy-selfsteal
+            if is_container_running "$CADDY_CONTAINER_NAME"; then
+                docker logs -f --tail=100 "$CADDY_CONTAINER_NAME"
+            else
+                docker logs -f --tail=100 caddy-selfsteal
+            fi
             ;;
         f2b|fail2ban)
             journalctl -u fail2ban -n 100 -f
@@ -2241,15 +2735,15 @@ show_status() {
     fi
 
     if is_container_running "remnanode"; then
-        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер remnanode (порт ${node_p})"
+        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер remnanode (порт ${node_p}, /certs:ro)"
     else
         box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер remnanode"
     fi
 
-    if is_container_running "caddy-selfsteal"; then
-        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер caddy-selfsteal (127.0.0.1:${caddy_p})"
+    if is_caddy_running; then
+        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${CADDY_CONTAINER_NAME} (127.0.0.1:${caddy_p})"
     else
-        box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер caddy-selfsteal"
+        box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер ${CADDY_CONTAINER_NAME}"
     fi
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
@@ -2267,29 +2761,6 @@ show_status() {
     fi
     box_bottom
     echo
-
-    box_top "НАЛОЖЕННЫЕ ОПТИМИЗАЦИИ (NODE-MGR TOOLKIT)"
-    local found=0 f
-    for f in "/etc/sysctl.d/${ND_DROPIN_PREFIX}-sysctl.conf" \
-             "/etc/security/limits.d/${ND_DROPIN_PREFIX}-limits.conf" \
-             "/etc/modules-load.d/${ND_DROPIN_PREFIX}.conf" \
-             "/etc/systemd/journald.conf.d/${ND_DROPIN_PREFIX}.conf"; do
-        if [ -e "$f" ]; then box_row "${GREEN}[+]${NC} ${f}"; found=1; fi
-    done
-    for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram; do
-        if [ -e "/etc/systemd/system/${svc}.service" ]; then box_row "${GREEN}[+]${NC} ${svc}.service"; found=1; fi
-    done
-    if command -v iptables >/dev/null 2>&1; then
-        if iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-            box_row "${GREEN}[+]${NC} iptables TCPMSS clamp (mangle OUTPUT)"
-            found=1
-        fi
-    fi
-    if [ "$found" -eq 0 ]; then
-        box_row "${DIM}Оптимизации еще не наложены (запустите: node-mgr optimize --all)${NC}"
-    fi
-    box_bottom
-    echo
 }
 
 show_installation_summary() {
@@ -2297,94 +2768,20 @@ show_installation_summary() {
     box_top "ИТОГИ РАЗВЕРТЫВАНИЯ УЗЛА LISSVPN"
     box_kv "Сетевой стек Highload" "$STATUS_NETWORK"
     box_kv "Docker Engine" "$STATUS_DOCKER"
-    box_kv "RemnawaveNode" "$STATUS_REMNANODE (порт: $(get_saved_node_port))"
-    box_kv "Caddy Selfsteal" "$STATUS_CADDY ($(get_saved_caddy_domain))"
+    box_kv "Caddy Selfsteal" "$STATUS_CADDY ($(get_saved_caddy_domain) : $(get_saved_caddy_port))"
+    box_kv "Remnawave API" "$STATUS_API ${DETAIL_NODE_UUID:+(Node UUID: $DETAIL_NODE_UUID)}"
+    box_kv "RemnawaveNode" "$STATUS_REMNANODE (порт: $(get_saved_node_port), /certs:ro)"
     box_kv "UFW Firewall (ACL)" "$STATUS_UFW (панель: $(get_saved_panel_ip))"
     box_kv "Fail2ban" "$STATUS_FAIL2BAN"
     box_bottom
     echo
 }
 
-run_full_install() {
-    _init_env
-    print_header "ПОЛНАЯ УСТАНОВКА И ОПТИМИЗАЦИЯ УЗЛА [1/6 .. 6/6]"
-
-    if ! check_disk_space 500 "/opt"; then
-        if ! prompt_yn "Продолжить? (y/n): " "n"; then exit 1; fi
-    fi
-    ensure_package_manager_available
-    _RESTORE_AUTO_UPDATES=true
-    install_base_utilities
-
-    echo -e "\n  ${ORANGE}${BOLD}[1/6] Оптимизация ядра, RPS, NIC и лимитов${NC}"
-    run_optimize "--all"
-
-    echo -e "\n  ${ORANGE}${BOLD}[2/6] Установка Docker Engine${NC}"
-    if install_docker && check_docker_compose; then
-        STATUS_DOCKER="установлен"
-    else
-        STATUS_DOCKER="ошибка"
-        exit 1
-    fi
-
-    echo -e "\n  ${ORANGE}${BOLD}[3/6] Установка RemnawaveNode${NC}"
-    install_remnanode
-
-    echo -e "\n  ${ORANGE}${BOLD}[4/6] Установка Caddy Selfsteal${NC}"
-    install_caddy_selfsteal
-
-    echo -e "\n  ${ORANGE}${BOLD}[5/6] Настройка UFW Firewall (Strict Panel ACL)${NC}"
-    setup_ufw
-
-    echo -e "\n  ${ORANGE}${BOLD}[6/6] Установка и запуск Fail2ban${NC}"
-    install_fail2ban
-
-    restore_auto_updates
-    _RESTORE_AUTO_UPDATES=false
-    show_installation_summary
-}
-
-run_selective_install() {
-    _init_env
-    print_header "ВЫБОРОЧНАЯ УСТАНОВКА / ПОЧИНКА МОДУЛЕЙ"
-    echo -e "    ${ORANGE}${BOLD}[1]${NC} Оптимизация ядра (sysctl/BBR/FD/RPS/NIC/MSS/journald)"
-    echo -e "    ${ORANGE}${BOLD}[2]${NC} Docker Engine & Compose v2"
-    echo -e "    ${ORANGE}${BOLD}[3]${NC} RemnawaveNode + Xray-core"
-    echo -e "    ${ORANGE}${BOLD}[4]${NC} Caddy Selfsteal + Шаблоны"
-    echo -e "    ${ORANGE}${BOLD}[5]${NC} UFW Firewall (доступ к порту ноды только с IP панели)"
-    echo -e "    ${ORANGE}${BOLD}[6]${NC} Fail2ban (починка конфига и перезапуск)"
-    echo
-
-    local selection_raw
-    read -p "  ${ORANGE}>${NC} Номера через пробел [1-6, Enter=все]: " -r selection_raw
-    selection_raw="${selection_raw:-1 2 3 4 5 6}"
-
-    ensure_package_manager_available
-    _RESTORE_AUTO_UPDATES=true
-    install_base_utilities
-
-    for c in $selection_raw; do
-        case "$c" in
-            1) run_optimize "--all" ;;
-            2) if install_docker && check_docker_compose; then STATUS_DOCKER="установлен"; fi ;;
-            3) install_remnanode ;;
-            4) install_caddy_selfsteal ;;
-            5) setup_ufw ;;
-            6) install_fail2ban ;;
-        esac
-    done
-
-    restore_auto_updates
-    _RESTORE_AUTO_UPDATES=false
-    show_installation_summary
-}
-
 update_components() {
     _init_env
     print_header "ОБНОВЛЕНИЕ КОМПОНЕНТОВ УЗЛА"
     if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
-        log_info "Обновление образа RemnawaveNode и ядра Xray-core..."
-        install_xray_core || true
+        log_info "Обновление образа RemnawaveNode..."
         docker compose --project-directory "$REMNANODE_DIR" pull
         docker compose --project-directory "$REMNANODE_DIR" up -d --remove-orphans
     fi
@@ -2409,11 +2806,15 @@ export_config() {
     umask 077
     cat > "$output" << EOF
 # LissVPN Node Orchestrator Configuration
+REMNAWAVE_API_URL="${REMNAWAVE_API_URL}"
+REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN}"
+NODE_NAME="${NODE_NAME:-$(hostname)}"
+NODE_ADDRESS="${NODE_ADDRESS:-$NODE_IP}"
+SELF_STEAL_DOMAIN="$(get_saved_caddy_domain)"
+SELF_STEAL_PORT=$(get_saved_caddy_port)
 CFG_SECRET_KEY="${cfg_secret}"
 CFG_NODE_PORT=$(get_saved_node_port)
 CFG_PANEL_IP="$(get_saved_panel_ip)"
-CFG_DOMAIN="$(get_saved_caddy_domain | sed 's/^\*\.//')"
-CFG_CADDY_PORT=$(get_saved_caddy_port)
 CFG_APPLY_NETWORK=y
 CFG_SETUP_UFW=y
 CFG_INSTALL_FAIL2BAN=y
@@ -2438,13 +2839,13 @@ uninstall_all() {
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
     fi
-    docker rm -f remnanode caddy-selfsteal 2>/dev/null || true
+    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal 2>/dev/null || true
 
     run_rollback
     rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-status.conf
     systemctl restart fail2ban 2>/dev/null || true
 
-    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
+    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" "$CADDY_HTML_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
     log_success "Все компоненты узла удалены."
 }
 
@@ -2455,6 +2856,7 @@ show_help() {
   Использование: node-mgr [КОМАНДА] [ОПЦИИ]
 
   Основные команды тулкита:
+    auto-deploy                  Полное авто-развертывание ноды, xhttp-профиля и хоста по API
     diagnose [-q|--no-net]       Диагностика ноды (27 чеков, дашборд, вердикт)
     optimize [--all|--from-findings|--zram|--sysctl|--rps|--nic|--mss]
                                  Тюнинг ядра, BBR, лимитов FD, RPS/RFS, NIC, TCPMSS, Zram
@@ -2462,15 +2864,22 @@ show_help() {
     rollback                     Откат всех наложенных оптимизаций
     status                       Показать состояние узла, контейнеров и артефактов
     logs {node|caddy|f2b}        Просмотр логов RemnaNode, Caddy или Fail2ban в реальном времени
-    install                      Полная пошаговая установка ноды под ключ
+    install                      Установка ноды (с выбором API или ручного режима)
     selective                    Выборочная установка или починка отдельных модулей
-    change-template              Смена HTML-шаблона маскировки Caddy Selfsteal
-    update                       Обновление Docker-образов и бинарника Xray-core
+    change-template              Смена HTML-шаблона маскировки (/opt/html)
+    update                       Обновление Docker-образов RemnaNode и Caddy
     self-update                  Обновление самого скрипта node-mgr из GitHub
     export-config [FILE]         Экспорт текущих настроек в конфиг-файл
     uninstall                    Удаление всех компонентов и откат настроек
     --config FILE                Автоматическая установка по конфиг-файлу
-    help | --help                Показать эту справку
+
+  Переменные окружения для Zero-Touch API деплоя:
+    REMNAWAVE_API_URL="https://panel.example.com"
+    REMNAWAVE_API_TOKEN="eyJ..."
+    NODE_NAME="DE-Frankfurt-01"
+    NODE_ADDRESS="84.54.57.173"
+    SELF_STEAL_DOMAIN="edge.example.com"
+    SELF_STEAL_PORT="9443"
 HELP
     echo
 }
@@ -2484,12 +2893,12 @@ show_main_menu() {
         echo
         echo -e "    ${ORANGE}${BOLD}[1]${NC} ${WHITE}Диагностика ноды${NC}     ${DIM}27 чеков, дашборд, аудит безопасности и вердикт${NC}"
         echo -e "    ${ORANGE}${BOLD}[2]${NC} ${WHITE}Оптимизация стека${NC}    ${DIM}sysctl / BBR / FD / RPS / NIC / TCPMSS / Zram${NC}"
-        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Полная установка${NC}     ${DIM}RemnawaveNode + Caddy Selfsteal + UFW + Fail2ban${NC}"
-        echo -e "    ${ORANGE}${BOLD}[4]${NC} ${WHITE}Выборочный запуск${NC}    ${DIM}установка или починка отдельных компонентов${NC}"
+        echo -e "    ${ORANGE}${BOLD}[3]${NC} ${WHITE}Авто-деплой по API${NC}   ${DIM}Нода + Профиль (xhttp) + Хост + Selfsteal + Certs${NC}"
+        echo -e "    ${ORANGE}${BOLD}[4]${NC} ${WHITE}Выборочный запуск${NC}    ${DIM}ручная установка или починка отдельных модулей${NC}"
         echo -e "    ${ORANGE}${BOLD}[5]${NC} ${WHITE}Статус системы${NC}       ${DIM}контейнеры, ядро, UFW ACL, наложенные артефакты${NC}"
         echo -e "    ${ORANGE}${BOLD}[6]${NC} ${WHITE}Ядро BBRv3 (XanMod)${NC}  ${DIM}установка ядра XanMod под микроархитектуру CPU${NC}"
-        echo -e "    ${ORANGE}${BOLD}[7]${NC} ${WHITE}Сменить шаблон SNI${NC}   ${DIM}быстрая смена HTML-лендинга Caddy Selfsteal${NC}"
-        echo -e "    ${ORANGE}${BOLD}[8]${NC} ${WHITE}Обновить компоненты${NC}  ${DIM}docker pull + Xray-core + self-update скрипта${NC}"
+        echo -e "    ${ORANGE}${BOLD}[7]${NC} ${WHITE}Сменить шаблон SNI${NC}   ${DIM}быстрая смена HTML-лендинга в /opt/html${NC}"
+        echo -e "    ${ORANGE}${BOLD}[8]${NC} ${WHITE}Обновить компоненты${NC}  ${DIM}docker pull + self-update скрипта с GitHub${NC}"
         echo -e "    ${ORANGE}${BOLD}[9]${NC} ${WHITE}Откат / Удаление${NC}     ${DIM}снять оптимизации (rollback) или удалить узел${NC}"
         echo -e "    ${ORANGE}${BOLD}[0]${NC} ${GRAPHITE}Выход${NC}"
         echo
@@ -2520,7 +2929,7 @@ show_main_menu() {
             6) run_bbr3_xanmod ;;
             7) change_template ;;
             8)
-                echo -e "    ${ORANGE}[1]${NC} Обновить контейнеры RemnaNode, Caddy и ядро Xray-core"
+                echo -e "    ${ORANGE}[1]${NC} Обновить контейнеры RemnaNode и Caddy"
                 echo -e "    ${ORANGE}[2]${NC} Обновить сам скрипт node-mgr с GitHub (self-update)"
                 printf "  ${ORANGE}>${NC} Выбор [Enter=1]: "
                 local uc=""
@@ -2560,6 +2969,13 @@ main() {
         load_config_file "$CONFIG_FILE"
     fi
 
+    # Если переданы переменные API в окружении — сразу запускаем авто-деплой
+    if [ -n "${REMNAWAVE_API_URL:-}" ] && [ -n "${REMNAWAVE_API_TOKEN:-}" ] && [ -n "${SELF_STEAL_DOMAIN:-}" ]; then
+        NON_INTERACTIVE=true
+        run_api_auto_deploy
+        return 0
+    fi
+
     if [ "${NON_INTERACTIVE:-false}" = true ]; then
         run_full_install
         return 0
@@ -2576,6 +2992,7 @@ cmd="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 
 case "$cmd" in
+    auto-deploy|--auto-deploy)         run_api_auto_deploy ;;
     diagnose|diag|--diagnose)          run_diagnose "${1:-full}" ;;
     optimize|opt|tune|--optimize)      run_optimize "${1:---all}" ;;
     bbr3|kernel|--bbr3)                run_bbr3_xanmod ;;
