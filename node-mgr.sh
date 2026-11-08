@@ -591,13 +591,14 @@ is_dpkg_locked() {
 }
 
 wait_for_dpkg_lock() {
-    local max_wait=180
+    local max_wait=30
     local waited=0
     if ! is_dpkg_locked; then return 0; fi
-    log_warning "Ожидание освобождения пакетного менеджера APT..."
+    log_warning "Ожидание освобождения пакетного менеджера APT (до ${max_wait} сек)..."
     while [ $waited -lt $max_wait ]; do
         if ! is_dpkg_locked; then
-            if dpkg --configure -a >/dev/null 2>&1; then return 0; fi
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a </dev/null >/dev/null 2>&1 || true
+            return 0
         fi
         sleep 3
         waited=$((waited + 3))
@@ -607,17 +608,16 @@ wait_for_dpkg_lock() {
 
 ensure_package_manager_available() {
     if [[ "$PKG_MANAGER" != "apt-get" ]]; then return 0; fi
-    local services_to_stop=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
+    local services_to_stop=("unattended-upgrades" "apt-daily.timer" "apt-daily-upgrade.timer" "apt-daily.service" "apt-daily-upgrade.service")
     for svc in "${services_to_stop[@]}"; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            systemctl stop "$svc" 2>/dev/null || true
-        fi
+        systemctl stop "$svc" 2>/dev/null || true
     done
     if is_dpkg_locked; then
         if ! wait_for_dpkg_lock; then
-            killall unattended-upgr apt-get apt 2>/dev/null || true
-            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null || true
-            dpkg --configure -a >/dev/null 2>&1 || true
+            log_warning "Принудительное снятие зависшей блокировки APT/dpkg..."
+            killall -9 unattended-upgr apt-get apt 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a </dev/null >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -632,22 +632,35 @@ install_package() {
     local install_log
     install_log=$(create_temp_file)
     local ok=false
+    local -a apt_opts=(
+        -y -qq
+        -o Dpkg::Options::="--force-confdef"
+        -o Dpkg::Options::="--force-confold"
+        -o Acquire::http::Timeout="15"
+        -o Acquire::https::Timeout="15"
+        -o Acquire::Retries="2"
+    )
 
     if [[ "$PKG_MANAGER" == "apt-get" ]]; then
-        if is_dpkg_locked; then wait_for_dpkg_lock || true; fi
+        if is_dpkg_locked; then
+            ensure_package_manager_available
+        fi
         if [ "${_APT_UPDATED:-}" != "true" ]; then
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq >"$install_log" 2>&1 || true
+            timeout 90 env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get update -qq -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" -o Acquire::Retries="2" \
+                </dev/null >"$install_log" 2>&1 || true
             _APT_UPDATED=true
         fi
-        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$package" >>"$install_log" 2>&1; then
+        if timeout 120 env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none \
+            apt-get install "${apt_opts[@]}" "$package" </dev/null >>"$install_log" 2>&1; then
             ok=true
         fi
     elif [[ "$PKG_MANAGER" == "yum" ]] || [[ "$PKG_MANAGER" == "dnf" ]]; then
-        if $PKG_MANAGER install -y -q "$package" >"$install_log" 2>&1; then
+        if timeout 120 $PKG_MANAGER install -y -q "$package" </dev/null >"$install_log" 2>&1; then
             ok=true
         fi
     elif [[ "$PKG_MANAGER" == "pacman" ]]; then
-        if pacman -S --noconfirm --quiet "$package" >"$install_log" 2>&1; then
+        if timeout 120 pacman -S --noconfirm --quiet "$package" </dev/null >"$install_log" 2>&1; then
             ok=true
         fi
     fi
@@ -663,8 +676,8 @@ install_base_utilities() {
         local bin="$pkg"
         if [ "$pkg" = "iproute2" ]; then bin="ss"; fi
         if [ "$pkg" = "ca-certificates" ]; then bin="update-ca-certificates"; fi
-        if ! command -v "$bin" >/dev/null 2>&1; then
-            install_package "$pkg" >/dev/null 2>&1 || true
+        if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "/usr/sbin/$bin" ] && [ ! -x "/sbin/$bin" ]; then
+            install_package "$pkg" || true
         fi
     done
 }
@@ -1518,7 +1531,7 @@ DefaultLimitNPROC=1048576
 EOF
     cp -f "/etc/systemd/system.conf.d/${ND_DROPIN_PREFIX}-limits.conf" "/etc/systemd/user.conf.d/${ND_DROPIN_PREFIX}-limits.conf" 2>/dev/null || true
     ulimit -n 1048576 2>/dev/null || true
-    systemctl daemon-reexec 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     _log_fix "FD limits set to 1048576 (PAM + systemd system/user)"
     log_success "Лимиты файловых дескрипторов установлены (1048576)"
 }
@@ -1590,8 +1603,8 @@ EOF
 
 opt_nic() {
     log_info "Тюнинг сетевой карты (GRO/GSO/TSO on, LRO off, txqueuelen 10000 & TCPMSS)..."
-    if ! command -v ethtool >/dev/null 2>&1; then
-        install_package ethtool >/dev/null 2>&1 || true
+    if ! command -v ethtool >/dev/null 2>&1 && [ ! -x /usr/sbin/ethtool ] && [ ! -x /sbin/ethtool ]; then
+        install_package ethtool || true
     fi
     cat > /usr/local/sbin/node-mgr-nic << 'EOF'
 #!/usr/bin/env bash
@@ -1655,10 +1668,13 @@ opt_irqbalance() {
         return 0
     fi
     log_info "Установка и запуск службы irqbalance..."
-    if ! command -v irqbalance >/dev/null 2>&1; then
-        install_package irqbalance >/dev/null 2>&1 || true
+    if ! command -v irqbalance >/dev/null 2>&1 && [ ! -x /usr/sbin/irqbalance ]; then
+        if ! install_package irqbalance; then
+            log_warning "Не удалось установить пакет irqbalance (пропускаем)"
+            return 0
+        fi
     fi
-    systemctl enable --now irqbalance >/dev/null 2>&1 || true
+    systemctl enable --now --no-block irqbalance >/dev/null 2>&1 || true
     _log_fix "irqbalance enabled"
     log_success "Служба irqbalance активна"
 }
