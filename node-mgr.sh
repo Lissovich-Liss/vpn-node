@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.1.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
-#  Cloudflare WARP AI Routing (Gemini + OpenAI) • Highload + CAKE • Protect
+#  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.2.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -105,7 +105,8 @@ NODE_NAME="${NODE_NAME:-}"
 NODE_ADDRESS="${NODE_ADDRESS:-}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN:-}"
 XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-}"
-XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
+XHTTP_PATH="${XHTTP_PATH:-}"
+CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
 VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
 XHTTP_INBOUND_PORT="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
@@ -467,6 +468,14 @@ get_saved_xhttp_domain() {
     echo "$xdom"
 }
 
+generate_random_xhttp_path() {
+    local prefixes=("/api/v2/telemetry" "/api/v3/events" "/cdn/assets/v1" "/rpc/v2/batch" "/graphql/v1/sync")
+    local prefix="${prefixes[$((RANDOM % ${#prefixes[@]}))]}"
+    local suffix
+    suffix=$(openssl rand -hex 4 2>/dev/null || printf '%08x' "$$")
+    echo "${prefix}/${suffix}"
+}
+
 get_saved_xhttp_path() {
     local xp="${XHTTP_PATH:-}"
     if [ -z "$xp" ] && [ -f "$API_STATE_FILE" ]; then
@@ -801,7 +810,7 @@ load_config_file() {
             log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
         fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -2509,7 +2518,13 @@ https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
     }
     root * /var/www/html
     encode zstd gzip
-    header -Server
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
     try_files {path} /index.html
     file_server
     log {
@@ -2523,12 +2538,14 @@ https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
 
 :{\$SELF_STEAL_PORT} {
     tls internal
+    header -Server
     respond 204
     log off
 }
 
 :80 {
     bind 0.0.0.0
+    header -Server
     respond 204
     log off
 }
@@ -3015,20 +3032,51 @@ collect_api_inputs() {
         fi
     fi
 
+    if [ -z "${XHTTP_PATH:-}" ]; then
+        if [ -f "$API_STATE_FILE" ]; then
+            XHTTP_PATH=$(grep -E '^XHTTP_PATH=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+        fi
+        if [ -z "${XHTTP_PATH:-}" ]; then
+            XHTTP_PATH=$(generate_random_xhttp_path)
+        fi
+    fi
+
     if [ "${NON_INTERACTIVE:-false}" != true ]; then
         local input_xpath=""
-        read -p "  ${ORANGE}>${NC} Путь XHTTP (XHTTP_PATH) [${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}]: " -r input_xpath
-        XHTTP_PATH="${input_xpath:-${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}}"
+        read -p "  ${ORANGE}>${NC} Путь XHTTP (XHTTP_PATH) [${XHTTP_PATH}]: " -r input_xpath
+        XHTTP_PATH="${input_xpath:-${XHTTP_PATH}}"
         if [[ "${XHTTP_PATH}" != /* ]]; then
             XHTTP_PATH="/${XHTTP_PATH}"
         fi
+
+        echo -e "  ${WHITE}uTLS Fingerprint хостов в подписке (анти-детект ТСПУ):${NC}"
+        echo -e "    ${ORANGE}1)${NC} randomized ${GRAPHITE}(новый uTLS-отпечаток при каждом соединении, рекомендуется)${NC}"
+        echo -e "    ${ORANGE}2)${NC} chrome     ${GRAPHITE}(классический отпечаток Chrome — максимальная совместимость)${NC}"
+        echo -e "    ${ORANGE}3)${NC} firefox    ${GRAPHITE}(браузерный профиль Firefox)${NC}"
+        echo -e "    ${ORANGE}4)${NC} ios        ${GRAPHITE}(мобильный профиль Safari/iOS)${NC}"
+        local def_fp_num="1"
+        case "${CFG_FINGERPRINT:-randomized}" in
+            chrome) def_fp_num="2" ;;
+            firefox) def_fp_num="3" ;;
+            ios) def_fp_num="4" ;;
+            *) def_fp_num="1" ;;
+        esac
+        local fp_choice="$def_fp_num"
+        prompt_choice "Выберите uTLS fingerprint [1-4, Enter=${def_fp_num}]: " 4 fp_choice "$def_fp_num"
+        case "$fp_choice" in
+            2) CFG_FINGERPRINT="chrome" ;;
+            3) CFG_FINGERPRINT="firefox" ;;
+            4) CFG_FINGERPRINT="ios" ;;
+            *) CFG_FINGERPRINT="randomized" ;;
+        esac
+
         if prompt_yn "Маршрутизировать Gemini и OpenAI/ChatGPT через Cloudflare WARP (y/n)? " "${CFG_ENABLE_WARP:-y}"; then
             CFG_ENABLE_WARP="y"
         else
             CFG_ENABLE_WARP="n"
         fi
     fi
-    XHTTP_PATH="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
+    CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
 
     if [ -z "${SELF_STEAL_PORT:-}" ]; then
         SELF_STEAL_PORT="$DEFAULT_PORT"
@@ -3056,9 +3104,19 @@ automate_remnawave_api() {
     print_header "АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ В REMNAWAVE API (L4: REALITY + XHTTP TLS + WARP)"
 
     local xhttp_dom="${XHTTP_STEAL_DOMAIN:-$(suggest_xhttp_domain "$SELF_STEAL_DOMAIN")}"
-    local xhttp_path="${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}"
+    local xhttp_path="${XHTTP_PATH:-}"
+    if [ -z "$xhttp_path" ]; then
+        if [ -f "$API_STATE_FILE" ]; then
+            xhttp_path=$(grep -E '^XHTTP_PATH=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+        fi
+        if [ -z "$xhttp_path" ]; then
+            xhttp_path=$(generate_random_xhttp_path)
+        fi
+    fi
+    XHTTP_PATH="$xhttp_path"
     local vision_port="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
     local xhttp_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
+    local host_fp="${CFG_FINGERPRINT:-randomized}"
     DETAIL_XHTTP_DOMAIN="$xhttp_dom"
 
     local cert_pair xhttp_cert_file xhttp_key_file
@@ -3147,6 +3205,7 @@ automate_remnawave_api() {
                             realitySettings: {
                                 show: false,
                                 xver: 0,
+                                maxTimeDiff: 300000,
                                 target: $dest,
                                 serverNames: [$v_dom],
                                 privateKey: $pk,
@@ -3173,10 +3232,14 @@ automate_remnawave_api() {
                             xhttpSettings: {
                                 host: $x_dom,
                                 path: $x_path,
-                                mode: "auto"
+                                mode: "auto",
+                                extra: {
+                                    xPaddingBytes: "100-1000"
+                                }
                             },
                             tlsSettings: {
                                 serverName: $x_dom,
+                                rejectUnknownSni: true,
                                 alpn: ["h2", "http/1.1"],
                                 minVersion: "1.2",
                                 certificates: [
@@ -3234,6 +3297,18 @@ automate_remnawave_api() {
                             {
                                 domain: ["geosite:private"],
                                 outboundTag: "BLOCK"
+                            },
+                            {
+                                domain: [
+                                    "domain:cp.cloudflare.com",
+                                    "domain:connectivitycheck.gstatic.com",
+                                    "domain:connectivitycheck.android.com",
+                                    "domain:clients3.google.com",
+                                    "domain:captive.apple.com",
+                                    "domain:www.msftconnecttest.com",
+                                    "domain:msftncsi.com"
+                                ],
+                                outboundTag: "DIRECT"
                             }
                         ] + (if $use_warp then [
                             {
@@ -3486,6 +3561,7 @@ automate_remnawave_api() {
             --arg remark "${NODE_NAME} [Reality]" \
             --arg addr "$SELF_STEAL_DOMAIN" \
             --arg sni "$SELF_STEAL_DOMAIN" \
+            --arg fp "$host_fp" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$vision_inbound_uuid" \
             --arg n_uuid "$node_uuid" \
@@ -3495,7 +3571,7 @@ automate_remnawave_api() {
                 port: 443,
                 sni: $sni,
                 securityLayer: "DEFAULT",
-                fingerprint: "chrome",
+                fingerprint: $fp,
                 nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
@@ -3507,7 +3583,7 @@ automate_remnawave_api() {
            || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$vision_host_payload" | jq 'del(.nodes)')" 2>/dev/null); then
             host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_HOST_UUID="$host_uuid"
-            log_success "Хост Reality создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443 -> dest 127.0.0.1:${SELF_STEAL_PORT})"
+            log_success "Хост Reality создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443, fp=${host_fp})"
         else
             log_warning "Хост Reality (${SELF_STEAL_DOMAIN}) уже существует или требует проверки в панели."
         fi
@@ -3520,6 +3596,7 @@ automate_remnawave_api() {
             --arg sni "$xhttp_dom" \
             --arg host_hdr "$xhttp_dom" \
             --arg path "$xhttp_path" \
+            --arg fp "$host_fp" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$xhttp_inbound_uuid" \
             --arg n_uuid "$node_uuid" \
@@ -3532,7 +3609,7 @@ automate_remnawave_api() {
                 path: $path,
                 alpn: "h2,http/1.1",
                 securityLayer: "TLS",
-                fingerprint: "chrome",
+                fingerprint: $fp,
                 nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
@@ -3544,7 +3621,7 @@ automate_remnawave_api() {
            || xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq 'del(.nodes, .alpn)')" 2>/dev/null); then
             xhost_uuid=$(echo "$xhost_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_XHTTP_HOST_UUID="$xhost_uuid"
-            log_success "Хост XHTTP TLS создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path})"
+            log_success "Хост XHTTP TLS создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path}, fp=${host_fp})"
         else
             log_warning "Хост XHTTP (${xhttp_dom}) уже существует или требует проверки в панели."
         fi
@@ -3564,6 +3641,7 @@ XHTTP_HOST_UUID="${DETAIL_XHTTP_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
 XHTTP_STEAL_DOMAIN="${xhttp_dom}"
 XHTTP_PATH="${xhttp_path}"
+CFG_FINGERPRINT="${host_fp}"
 XHTTP_CERT_FILE="${xhttp_cert_file}"
 XHTTP_KEY_FILE="${xhttp_key_file}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT}"
@@ -4391,7 +4469,8 @@ dry_run() {
     box_kv "IP узла / SSH порт" "${NODE_ADDRESS:-$NODE_IP} | SSH: $(detect_ssh_port)/tcp"
     box_kv "Remnawave API URL" "${REMNAWAVE_API_URL:-не задан (интерактивный запрос)}"
     box_kv "Домен Vision (:10443)" "${SELF_STEAL_DOMAIN:-$(get_saved_caddy_domain)} -> Selfsteal 127.0.0.1:${SELF_STEAL_PORT}"
-    box_kv "Домен XHTTP TLS (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-$DEFAULT_XHTTP_PATH}, certs: /certs:ro)"
+    box_kv "Домен XHTTP TLS (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-auto}, certs: /certs:ro)"
+    box_kv "Анти-детект (DPI/uTLS)" "fp=${CFG_FINGERPRINT:-randomized} | maxTimeDiff=300s | xPadding=100-1000 | rejectUnknownSni=true"
     box_kv "WARP AI Outbound" "CFG_ENABLE_WARP=${CFG_ENABLE_WARP:-y} (Gemini + OpenAI -> WireGuard WARP)"
     box_kv "Метод выпуска SSL" "$([ "${CFG_CERT_TYPE:-1}" = "2" ] && echo "Cloudflare DNS-01" || echo "Let's Encrypt HTTP-01 (:80)")"
     box_kv "Порт API Ноды" "${CFG_NODE_PORT:-$(get_saved_node_port)}/tcp (ACL для панели: ${CFG_PANEL_IP:-$(get_saved_panel_ip)})"
@@ -4776,6 +4855,7 @@ NODE_ADDRESS="${NODE_ADDRESS:-$NODE_IP}"
 SELF_STEAL_DOMAIN="$(get_saved_caddy_domain)"
 XHTTP_STEAL_DOMAIN="$(get_saved_xhttp_domain)"
 XHTTP_PATH="$(get_saved_xhttp_path)"
+CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
@@ -4876,7 +4956,8 @@ show_help() {
     NODE_ADDRESS="82.47.155.72"
     SELF_STEAL_DOMAIN="nl1.example.com"
     XHTTP_STEAL_DOMAIN="x-nl1.example.com"
-    XHTTP_PATH="/api/v3/sync/r1"
+    XHTTP_PATH="/api/v2/telemetry/a1b2c3d4" # по умолчанию генерируется уникальный путь
+    CFG_FINGERPRINT="randomized"            # randomized | chrome | firefox | ios
     SELF_STEAL_PORT="9443"
     CFG_ENABLE_WARP="y"          # y = маршрутизировать Gemini + OpenAI через WARP WireGuard
     CFG_CERT_TYPE="1"            # 1 = Let's Encrypt HTTP-01 (:80), 2 = Cloudflare DNS-01

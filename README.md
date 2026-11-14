@@ -2,9 +2,9 @@
 
 # 🦊 LissVPN Node Orchestrator (`node-mgr`)
 
-**Production-ready оркестратор v4.1, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS с пробросом `/certs:ro`), авто-регистратор Cloudflare WARP (Gemini + OpenAI/ChatGPT), E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
+**Production-ready оркестратор v4.2, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS с пробросом `/certs:ro`), Anti-Detect DPI/uTLS твики (`randomized` fp, уникальный `XHTTP_PATH`, `xPaddingBytes`, `maxTimeDiff`, `rejectUnknownSni`, Captive Portal `DIRECT`), авто-регистратор Cloudflare WARP (Gemini + OpenAI/ChatGPT), E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
 
-[![Version](https://img.shields.io/badge/version-v4.1.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
+[![Version](https://img.shields.io/badge/version-v4.2.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
 [![OS](https://img.shields.io/badge/Ubuntu_22.04%2F24.04_%7C_Debian_11%2F12-151419?style=for-the-badge&logo=debian&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Docker](https://img.shields.io/badge/Docker_Compose_v2_+_Caddy_L4-151419?style=for-the-badge&logo=docker&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Security](https://img.shields.io/badge/UFW_+_Fail2ban_+_nftables-Strict_ACL-2ECC71?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
@@ -13,9 +13,15 @@
 
 ---
 
-## ⚡ Что нового в версии v4.1
+## ⚡ Что нового в версии v4.2
 
-* **🔀 Возвращён VLESS XHTTP TLS за Caddy L4 SNI Router + проброс `/certs:ro`:**
+* **🛡️ Anti-Detect пакет против эвристики ТСПУ и активного пробинга:**
+  * **Выбор uTLS Fingerprint (`CFG_FINGERPRINT`):** в мастере и API-хостах (`/api/hosts`) по умолчанию используется `randomized` (генерация свежего ClientHello при каждом подключении вместо статичного `chrome`, с возможностью выбрать `chrome`, `firefox`, `ios`).
+  * **Уникальный `XHTTP_PATH` для каждой ноды:** вместо одного шаблона `/api/v3/sync/r1` генерируется индивидуальный правдоподобный путь (`/api/v2/telemetry/<hex>`, `/cdn/assets/v1/<hex>` и др.) с сохранением в стейте и конфиге.
+  * **Усиление XHTTP + TLS + Reality:** добавлены `xhttpSettings.extra.xPaddingBytes: "100-1000"` (рандомизация размеров HTTP-пакетов), `tlsSettings.rejectUnknownSni: true` и `realitySettings.maxTimeDiff: 300000` (anti-replay окно 5 минут).
+  * **Captive Portal / Connectivity `DIRECT`:** домены проверки интернета Android/iOS/Windows (`cp.cloudflare.com`, `connectivitycheck.gstatic.com`, `captive.apple.com`, `www.msftconnecttest.com` и др.) явно направляются в `DIRECT`.
+  * **Web-заголовки Selfsteal Caddy:** добавлены `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` и полное удаление заголовка `Server` на `:443`, `:9443` и `:80`.
+* **🔀 VLESS XHTTP TLS за Caddy L4 SNI Router + проброс `/certs:ro`:**
   * На внешнем порту `:443/tcp` работает **Caddy L4** (`caddy-l4:local`, `github.com/mholt/caddy-l4`), разделяя входящий TLS-трафик по `SNI` без терминации:
     * `SELF_STEAL_DOMAIN` ──► `127.0.0.1:10443` (**VLESS Reality Vision** ──► fallback `127.0.0.1:9443`).
     * `XHTTP_STEAL_DOMAIN` ──► `127.0.0.1:10444` (**VLESS XHTTP + TLS**, который использует реальные SSL-сертификаты Let's Encrypt от Caddy из тома `${CADDY_DATA_VOL}:/certs:ro`).
