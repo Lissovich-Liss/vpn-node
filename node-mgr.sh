@@ -3075,13 +3075,9 @@ automate_remnawave_api() {
 
     # Авто-регистрация WARP WireGuard (если включен для Gemini + OpenAI/ChatGPT)
     local warp_active=false
-    local warp_reserved_json="[]"
     if [[ "${CFG_ENABLE_WARP:-y}" =~ ^[Yy]$ ]]; then
         if ensure_warp_credentials; then
             warp_active=true
-            if [[ "${WARP_RESERVED:-}" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
-                warp_reserved_json="[${WARP_RESERVED}]"
-            fi
         fi
     else
         STATUS_WARP="отключен"
@@ -3118,7 +3114,6 @@ automate_remnawave_api() {
         --arg w_v6 "${WARP_IPV6:-}" \
         --arg w_pub "${WARP_PUBLIC_KEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}" \
         --arg w_ep "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" \
-        --argjson w_res "$warp_reserved_json" \
         '{
             name: $name,
             config: {
@@ -3136,7 +3131,6 @@ automate_remnawave_api() {
                         listen: "127.0.0.1",
                         protocol: "vless",
                         settings: {
-                            clients: [],
                             decryption: "none"
                         },
                         sniffing: {
@@ -3153,7 +3147,6 @@ automate_remnawave_api() {
                             realitySettings: {
                                 show: false,
                                 xver: 0,
-                                dest: $dest,
                                 target: $dest,
                                 serverNames: [$v_dom],
                                 privateKey: $pk,
@@ -3167,7 +3160,6 @@ automate_remnawave_api() {
                         listen: "127.0.0.1",
                         protocol: "vless",
                         settings: {
-                            clients: [],
                             decryption: "none"
                         },
                         sniffing: {
@@ -3201,10 +3193,7 @@ automate_remnawave_api() {
                     [
                         {
                             tag: "DIRECT",
-                            protocol: "freedom",
-                            settings: {
-                                domainStrategy: "UseIPv4"
-                            }
+                            protocol: "freedom"
                         },
                         {
                             tag: "BLOCK",
@@ -3214,21 +3203,19 @@ automate_remnawave_api() {
                         {
                             tag: "WARP",
                             protocol: "wireguard",
-                            settings: (
-                                {
-                                    secretKey: $w_priv,
-                                    address: (if $w_v6 != "" then ["172.16.0.2/32", ($w_v6 + "/128")] else ["172.16.0.2/32"] end),
-                                    peers: [
-                                        {
-                                            publicKey: $w_pub,
-                                            allowedIPs: ["0.0.0.0/0", "::/0"],
-                                            endpoint: $w_ep
-                                        }
-                                    ],
-                                    mtu: 1280,
-                                    domainStrategy: "ForceIPv4"
-                                } + (if ($w_res | length) == 3 then {reserved: $w_res} else {} end)
-                            )
+                            settings: {
+                                secretKey: $w_priv,
+                                address: (if $w_v6 != "" then ["172.16.0.2/32", ($w_v6 + "/128")] else ["172.16.0.2/32"] end),
+                                peers: [
+                                    {
+                                        publicKey: $w_pub,
+                                        allowedIPs: ["0.0.0.0/0", "::/0"],
+                                        endpoint: $w_ep
+                                    }
+                                ],
+                                mtu: 1280,
+                                domainStrategy: "ForceIPv4"
+                            }
                         }
                     ] else [] end)
                 ),
@@ -3237,23 +3224,19 @@ automate_remnawave_api() {
                     rules: (
                         [
                             {
-                                type: "field",
                                 protocol: ["bittorrent"],
                                 outboundTag: "BLOCK"
                             },
                             {
-                                type: "field",
                                 ip: ["geoip:private"],
                                 outboundTag: "BLOCK"
                             },
                             {
-                                type: "field",
                                 domain: ["geosite:private"],
                                 outboundTag: "BLOCK"
                             }
                         ] + (if $use_warp then [
                             {
-                                type: "field",
                                 domain: [
                                     "domain:gemini.google.com",
                                     "domain:aistudio.google.com",

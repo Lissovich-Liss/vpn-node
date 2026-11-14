@@ -22,7 +22,7 @@
     * Любой другой SNI / IP-скан ──► `127.0.0.1:9443` (catch-all `HTTP 204`).
 * **🌐 Cloudflare WARP WireGuard outbound (`WARP`) для Gemini и OpenAI/ChatGPT:**
   * Во время развертывания (или командой `node-mgr warp`) автоматически генерируется WireGuard X25519-ключ и регистрируется бесплатный WARP-аккаунт в Cloudflare API с сохранением в `/var/lib/node-mgr/warp.env` (`chmod 600`).
-  * В Config Profile панели добавляется нативный outbound `WARP` (`protocol: "wireguard"`, `mtu: 1280`, `reserved`) и правила маршрутизации для доменов **Gemini**, **Google AI Studio**, **NotebookLM**, **ChatGPT**, **OpenAI** и **Sora**.
+  * В Config Profile панели добавляется нативный outbound `WARP` (`protocol: "wireguard"`, `mtu: 1280`) и правила маршрутизации для доменов **Gemini**, **Google AI Studio**, **NotebookLM**, **ChatGPT**, **OpenAI** и **Sora**.
 * **🔬 Сквозной E2E-верификатор рукопожатий (`node-mgr verify`):**
   * Проверка `Caddy L4 (:443)` ──► `Xray Vision (:10443)` ──► `Selfsteal (:9443)` и реального TLS-рукопожатия `Caddy L4 (:443)` ──► `XHTTP TLS (:10444)` с проверкой читаемости сертификатов в `remnanode:/certs:ro`.
   * Имитация активного пробинга сканером с чужим SNI (`scanner-probe.invalid:443`) -> `HTTP 204`.
