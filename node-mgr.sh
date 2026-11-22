@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.1 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.2 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.2.1"
+readonly SCRIPT_VERSION="4.2.2"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -327,7 +327,14 @@ check_container_health() {
     local waited=0
     while [ $waited -lt "$max_wait" ]; do
         if is_container_running "$cname"; then
-            return 0
+            local restarting=""
+            restarting=$(docker inspect -f '{{.State.Restarting}}' "$cname" 2>/dev/null || echo "false")
+            if [ "$restarting" != "true" ]; then
+                sleep 1
+                if is_container_running "$cname"; then
+                    return 0
+                fi
+            fi
         fi
         sleep 2
         waited=$((waited + 2))
@@ -2298,26 +2305,36 @@ select_and_download_template() {
     download_template "${entry%%:*}" "${entry#*:}"
 }
 
-# ── Ожидание выписки Let's Encrypt сертификата в томе Caddy ───────
+# ── Ожидание выписки ACME сертификата в томе Caddy ───────────────
 wait_for_caddy_certificate() {
     local domain="$1"
     local max_wait="${2:-90}"
     local waited=0
 
-    log_info "Ожидание выпуска Let's Encrypt сертификата для ${domain} (до ${max_wait} сек)..."
+    log_info "Ожидание выпуска SSL-сертификата для ${domain} (до ${max_wait} сек)..."
     while [ $waited -lt "$max_wait" ]; do
-        if is_container_running "$CADDY_CONTAINER_NAME"; then
-            local found_crt=""
-            found_crt=$(docker exec "$CADDY_CONTAINER_NAME" sh -c "find /data/caddy/certificates -type f -name '${domain}.crt' 2>/dev/null | head -1" 2>/dev/null || true)
-            if [ -n "$found_crt" ]; then
-                log_success "Сертификат Let's Encrypt успешно получен: ${found_crt}"
-                return 0
-            fi
+        local c_running="" c_restarting=""
+        c_running=$(docker inspect -f '{{.State.Running}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || echo "false")
+        c_restarting=$(docker inspect -f '{{.State.Restarting}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || echo "false")
+        if [ "$c_running" != "true" ] || [ "$c_restarting" = "true" ]; then
+            log_error "Контейнер ${CADDY_CONTAINER_NAME} остановился или перезапускается во время выпуска сертификата!"
+            docker logs --tail 25 "$CADDY_CONTAINER_NAME" 2>&1 | sed 's/^/    /' || true
+            return 1
+        fi
+        local found_crt=""
+        found_crt=$(docker exec "$CADDY_CONTAINER_NAME" sh -c "find /data/caddy/certificates -type f -name '${domain}.crt' 2>/dev/null | head -1" 2>/dev/null || true)
+        if [ -n "$found_crt" ]; then
+            log_success "SSL-сертификат успешно получен: ${found_crt}"
+            return 0
         fi
         sleep 3
         waited=$((waited + 3))
     done
-    log_warning "Таймаут ожидания сертификата (${max_wait}с). Убедитесь, что DNS A-запись ${domain} указывает на ${NODE_IP} и порт 80 открыт."
+
+    log_warning "Таймаут ожидания сертификата для ${domain} (${max_wait}с)."
+    log_info "Последние ошибки ACME/TLS из логов ${CADDY_CONTAINER_NAME}:"
+    docker logs --tail 40 "$CADDY_CONTAINER_NAME" 2>&1 | grep -iE 'error|err|acme|challenge|obtain|tls|nxdomain|timeout|refused|rate|unauthorized|cloudflare' | tail -n 12 | sed 's/^/    /' || true
+    log_warning "Проверьте DNS A/AAAA запись ${domain} -> ${NODE_IP} (Cloudflare: серое облако DNS-only) и открытость 80/tcp в облачном фаерволе."
     return 0
 }
 
@@ -2588,17 +2605,17 @@ EOF
     if [ "$cert_choice" = "2" ]; then
         tls_block_cfg="dns cloudflare {env.CLOUDFLARE_API_TOKEN}"
     else
+        # Не фиксируем ca — Caddy сам откатится на ZeroSSL при лимитах/сбое Let's Encrypt
         tls_block_cfg="issuer acme {
-            ca https://acme-v02.api.letsencrypt.org/directory
             disable_tlsalpn_challenge
         }"
     fi
 
     # 4. Генерация /opt/selfsteel/Caddyfile (L4 SNI-роутинг на :443 + Selfsteal HTTPS на 127.0.0.1:9443)
+    # ВАЖНО: не задаём default_bind 127.0.0.1 глобально, чтобы :80 слушал IPv4+IPv6 (0.0.0.0 и ::) для ACME HTTP-01
     cat > "$CADDY_DIR/Caddyfile" << EOF
 {
     https_port {\$SELF_STEAL_PORT}
-    default_bind 127.0.0.1
     auto_https disable_redirects
     admin off
 
@@ -2622,11 +2639,11 @@ EOF
 }
 
 http://{\$SELF_STEAL_DOMAIN}, http://{\$XHTTP_STEAL_DOMAIN} {
-    bind 0.0.0.0
     redir https://{host}{uri} permanent
 }
 
 https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
+    bind 127.0.0.1
     tls {
         ${tls_block_cfg}
     }
@@ -2651,17 +2668,16 @@ https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
 }
 
 :{\$SELF_STEAL_PORT} {
+    bind 127.0.0.1
     tls internal
     header -Server
     respond 204
-    log off
 }
 
 :80 {
-    bind 0.0.0.0
+    @not_acme not path /.well-known/acme-challenge/*
     header -Server
-    respond 204
-    log off
+    respond @not_acme 204
 }
 EOF
 
@@ -2692,22 +2708,44 @@ volumes:
     name: selfsteel_caddy_config_selfsteal
 EOF
 
-    # 6. Сборка/загрузка образа Caddy L4 (быстро без OOM) и ожидание обоих сертификатов
+    # 6. Pre-flight портов 80/443, сборка образа, валидация Caddyfile и запуск
     docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        ufw allow 80/tcp comment 'Caddy ACME HTTP-01' >/dev/null 2>&1 || true
+        ufw allow 443/tcp comment 'Xray Reality TCP' >/dev/null 2>&1 || true
+        ufw allow 443/udp comment 'Xray Reality QUIC' >/dev/null 2>&1 || true
+    fi
+    local port_conflict
+    port_conflict=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)\s' || true)
+    if [ -n "$port_conflict" ]; then
+        log_warning "Обнаружены процессы на портах 80/443 перед запуском Caddy:"
+        echo "$port_conflict" | sed 's/^/    /'
+    fi
+
     if ! build_caddy_l4_image "$cert_choice" "false"; then
         log_error "Не удалось собрать образ caddy-l4:local"
         STATUS_CADDY="ошибка"
         return 1
     fi
+
+    local validate_out=""
+    if ! validate_out=$(docker compose --project-directory "$CADDY_DIR" run --rm --no-deps --entrypoint caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
+        log_error "Ошибка синтаксиса Caddyfile:"
+        echo "$validate_out" | tail -n 15 | sed 's/^/    /'
+        STATUS_CADDY="ошибка"
+        return 1
+    fi
+
     docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
 
     if check_container_health "$CADDY_CONTAINER_NAME" 30; then
         log_success "Контейнер ${CADDY_CONTAINER_NAME} запущен (L4 :443 -> Vision :${VISION_INBOUND_PORT} / XHTTP :${XHTTP_INBOUND_PORT} | Selfsteal 127.0.0.1:${SELF_STEAL_PORT})"
-        wait_for_caddy_certificate "$SELF_STEAL_DOMAIN" 60
-        wait_for_caddy_certificate "$XHTTP_STEAL_DOMAIN" 60
+        wait_for_caddy_certificate "$SELF_STEAL_DOMAIN" 90
+        wait_for_caddy_certificate "$XHTTP_STEAL_DOMAIN" 90
         STATUS_CADDY="установлен"
     else
-        log_error "Контейнер ${CADDY_CONTAINER_NAME} не запустился. Проверьте: node-mgr logs caddy"
+        log_error "Контейнер ${CADDY_CONTAINER_NAME} не запустился. Последние логи:"
+        docker logs --tail 25 "$CADDY_CONTAINER_NAME" 2>&1 | sed 's/^/    /' || true
         STATUS_CADDY="ошибка"
         return 1
     fi
