@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.2 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.3 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.2.2"
+readonly SCRIPT_VERSION="4.2.3"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -3414,6 +3414,7 @@ automate_remnawave_api() {
                             settings: {
                                 secretKey: $w_priv,
                                 address: (if $w_v6 != "" then ["172.16.0.2/32", ($w_v6 + "/128")] else ["172.16.0.2/32"] end),
+                                noKernelTun: true,
                                 peers: [
                                     {
                                         publicKey: $w_pub,
