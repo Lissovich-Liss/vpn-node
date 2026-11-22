@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.1 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.2.0"
+readonly SCRIPT_VERSION="4.2.1"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -2321,6 +2321,118 @@ wait_for_caddy_certificate() {
     return 0
 }
 
+# ── Сборка/загрузка образа Caddy L4 (быстрая предсборка + OOM-safe fallback) ─
+build_caddy_l4_image() {
+    local cert_choice="${1:-1}"
+    local force_rebuild="${2:-false}"
+
+    local need_build=false
+    if [ "$force_rebuild" = "true" ] || ! docker image inspect caddy-l4:local >/dev/null 2>&1; then
+        need_build=true
+    elif ! docker run --rm caddy-l4:local caddy list-modules 2>/dev/null | grep -q "layer4"; then
+        need_build=true
+    elif [ "$cert_choice" = "2" ] && ! docker run --rm caddy-l4:local caddy list-modules 2>/dev/null | grep -q "dns.providers.cloudflare"; then
+        need_build=true
+    fi
+
+    if [ "$need_build" != "true" ]; then
+        return 0
+    fi
+
+    # Шаг A: Быстрая загрузка официальной предсборки с caddyserver.com/api/download (без компиляции Go на VPS)
+    local caddy_arch=""
+    case "$(uname -m)" in
+        x86_64|amd64) caddy_arch="amd64" ;;
+        aarch64|arm64) caddy_arch="arm64" ;;
+    esac
+
+    if [ -n "$caddy_arch" ]; then
+        local dl_url="https://caddyserver.com/api/download?os=linux&arch=${caddy_arch}&p=github.com/mholt/caddy-l4"
+        local mod_check="layer4"
+        if [ "$cert_choice" = "2" ]; then
+            dl_url="${dl_url}&p=github.com/caddy-dns/cloudflare"
+            mod_check="dns.providers.cloudflare"
+        fi
+
+        log_info "Загрузка официальной сборки Caddy L4 (${caddy_arch}) без нагрузки на RAM/CPU..."
+        rm -f "$CADDY_DIR/caddy.bin.tmp"
+        if curl -fsSL --connect-timeout 15 --max-time 120 "$dl_url" -o "$CADDY_DIR/caddy.bin.tmp" 2>/dev/null; then
+            local bin_size elf_magic
+            bin_size=$(stat -c%s "$CADDY_DIR/caddy.bin.tmp" 2>/dev/null || wc -c < "$CADDY_DIR/caddy.bin.tmp" 2>/dev/null || echo 0)
+            elf_magic=$(od -An -N4 -tx1 "$CADDY_DIR/caddy.bin.tmp" 2>/dev/null | tr -d ' \n' || true)
+            if [ "${bin_size:-0}" -gt 15000000 ] && [ "$elf_magic" = "7f454c46" ]; then
+                mv -f "$CADDY_DIR/caddy.bin.tmp" "$CADDY_DIR/caddy.bin"
+                chmod 755 "$CADDY_DIR/caddy.bin"
+                cat > "$CADDY_DIR/Dockerfile" << EOF
+FROM caddy:2-alpine
+COPY caddy.bin /usr/bin/caddy
+RUN chmod 755 /usr/bin/caddy && /usr/bin/caddy list-modules | grep -q "${mod_check}"
+EOF
+                if docker compose --project-directory "$CADDY_DIR" build --pull; then
+                    log_success "Образ caddy-l4:local собран из официальной предсборки за секунды"
+                    return 0
+                fi
+            fi
+        fi
+        rm -f "$CADDY_DIR/caddy.bin.tmp" "$CADDY_DIR/caddy.bin"
+        log_warning "Быстрая загрузка предсборки Caddy не удалась, переходим к xcaddy fallback (1 поток + swap-защита)..."
+    fi
+
+    # Шаг B (Fallback): Локальная компиляция xcaddy с ограничением памяти Go и временным swap при RAM+Swap < 2.5 GB
+    local total_mem_swap_mb free_disk_mb temp_swap=""
+    total_mem_swap_mb=$(awk '/MemTotal|SwapTotal/ {sum+=$2} END {print int(sum/1024)}' /proc/meminfo 2>/dev/null || echo 2048)
+    if [ "${total_mem_swap_mb:-0}" -lt 2500 ]; then
+        free_disk_mb=$(df -Pm /var/tmp 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+        if [ "${free_disk_mb:-0}" -gt 2200 ]; then
+            temp_swap="/var/tmp/node-mgr-caddy.swap"
+            log_info "Мало памяти (${total_mem_swap_mb} МБ RAM+Swap): подключаем временный swap 1.5 ГБ для Go build..."
+            rm -f "$temp_swap"
+            if fallocate -l 1536M "$temp_swap" 2>/dev/null || dd if=/dev/zero of="$temp_swap" bs=1M count=1536 status=none 2>/dev/null; then
+                chmod 600 "$temp_swap"
+                if mkswap "$temp_swap" >/dev/null 2>&1 && swapon "$temp_swap" 2>/dev/null; then
+                    true
+                else
+                    rm -f "$temp_swap"
+                    temp_swap=""
+                fi
+            else
+                rm -f "$temp_swap"
+                temp_swap=""
+            fi
+        fi
+    fi
+
+    if [ "$cert_choice" = "2" ]; then
+        cat > "$CADDY_DIR/Dockerfile" << 'EOF'
+FROM caddy:2-builder AS builder
+ENV GOMAXPROCS=1 CGO_ENABLED=0 GOFLAGS="-p=1" GOMEMLIMIT=700MiB
+RUN xcaddy build --with github.com/mholt/caddy-l4 --with github.com/caddy-dns/cloudflare
+
+FROM caddy:2-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+EOF
+    else
+        cat > "$CADDY_DIR/Dockerfile" << 'EOF'
+FROM caddy:2-builder AS builder
+ENV GOMAXPROCS=1 CGO_ENABLED=0 GOFLAGS="-p=1" GOMEMLIMIT=700MiB
+RUN xcaddy build --with github.com/mholt/caddy-l4
+
+FROM caddy:2-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+EOF
+    fi
+
+    log_info "Сборка образа Caddy с модулем layer4 через xcaddy (1 поток; на 1 vCPU занимает 2-5 мин)..."
+    local build_rc=0
+    docker compose --project-directory "$CADDY_DIR" build || build_rc=$?
+
+    if [ -n "$temp_swap" ]; then
+        swapoff "$temp_swap" 2>/dev/null || true
+        rm -f "$temp_swap" 2>/dev/null || true
+    fi
+    return "$build_rc"
+}
+
 # ── Развертывание Caddy Selfsteal в /opt/selfsteel ────────────────
 install_caddy_selfsteal() {
     print_header "РАЗВЕРТЫВАНИЕ CADDY SELFSTEAL (/opt/selfsteel)"
@@ -2451,10 +2563,11 @@ EOF
     chmod 600 "$CADDY_DIR/.env"
     umask 022
 
-    # 3. Генерация Dockerfile для сборки Caddy с модулем github.com/mholt/caddy-l4 (+ cloudflare при DNS-01)
+    # 3. Заготовка Dockerfile (при наличии caddy.bin или xcaddy fallback в build_caddy_l4_image)
     if [ "$cert_choice" = "2" ]; then
         cat > "$CADDY_DIR/Dockerfile" << 'EOF'
 FROM caddy:2-builder AS builder
+ENV GOMAXPROCS=1 CGO_ENABLED=0 GOFLAGS="-p=1" GOMEMLIMIT=700MiB
 RUN xcaddy build --with github.com/mholt/caddy-l4 --with github.com/caddy-dns/cloudflare
 
 FROM caddy:2-alpine
@@ -2463,6 +2576,7 @@ EOF
     else
         cat > "$CADDY_DIR/Dockerfile" << 'EOF'
 FROM caddy:2-builder AS builder
+ENV GOMAXPROCS=1 CGO_ENABLED=0 GOFLAGS="-p=1" GOMEMLIMIT=700MiB
 RUN xcaddy build --with github.com/mholt/caddy-l4
 
 FROM caddy:2-alpine
@@ -2578,19 +2692,12 @@ volumes:
     name: selfsteel_caddy_config_selfsteal
 EOF
 
-    # 6. Сборка (при необходимости) и запуск контейнера Caddy L4 + ожидание обоих сертификатов
+    # 6. Сборка/загрузка образа Caddy L4 (быстро без OOM) и ожидание обоих сертификатов
     docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
-    local need_build=false
-    if ! docker image inspect caddy-l4:local >/dev/null 2>&1; then
-        need_build=true
-    elif [ "$cert_choice" = "2" ]; then
-        if ! docker run --rm caddy-l4:local caddy list-modules 2>/dev/null | grep -q "dns.providers.cloudflare"; then
-            need_build=true
-        fi
-    fi
-    if [ "$need_build" = true ]; then
-        log_info "Сборка образа Caddy с модулем layer4 (github.com/mholt/caddy-l4)..."
-        docker compose --project-directory "$CADDY_DIR" build
+    if ! build_caddy_l4_image "$cert_choice" "false"; then
+        log_error "Не удалось собрать образ caddy-l4:local"
+        STATUS_CADDY="ошибка"
+        return 1
     fi
     docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
 
@@ -4810,7 +4917,11 @@ update_components() {
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         log_info "Обновление образа Caddy Selfsteal..."
         if [ -f "$CADDY_DIR/Dockerfile" ]; then
-            docker compose --project-directory "$CADDY_DIR" build --pull
+            local upd_cert="1"
+            if grep -q 'dns cloudflare' "$CADDY_DIR/Caddyfile" 2>/dev/null; then
+                upd_cert="2"
+            fi
+            build_caddy_l4_image "$upd_cert" "true"
         else
             docker compose --project-directory "$CADDY_DIR" pull
         fi
