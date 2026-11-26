@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.2.3 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.3.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.2.3"
+readonly SCRIPT_VERSION="4.3.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -106,6 +106,7 @@ NODE_ADDRESS="${NODE_ADDRESS:-}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN:-}"
 XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-}"
 XHTTP_PATH="${XHTTP_PATH:-}"
+CFG_XHTTP_CDN="${CFG_XHTTP_CDN:-y}"
 CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
 VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
@@ -491,6 +492,17 @@ get_saved_xhttp_path() {
     echo "${xp:-$DEFAULT_XHTTP_PATH}"
 }
 
+get_saved_xhttp_cdn() {
+    local xcdn=""
+    if [ -f "$API_STATE_FILE" ]; then
+        xcdn=$(grep -E '^(CFG_XHTTP_CDN|XHTTP_CDN)=' "$API_STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    if [ -z "$xcdn" ] && [ -f "$CADDY_DIR/.env" ]; then
+        xcdn=$(grep -E '^XHTTP_CDN=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    echo "${xcdn:-${CFG_XHTTP_CDN:-y}}"
+}
+
 get_caddy_cert_paths() {
     local clean_dom="${1#\*.}"
     local default_crt="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${clean_dom}/${clean_dom}.crt"
@@ -817,7 +829,7 @@ load_config_file() {
             log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
         fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -870,6 +882,29 @@ validate_domain_dns() {
         return 1
     fi
     log_success "DNS настроен корректно: ${domain} -> ${dns_ip}"
+    return 0
+}
+
+validate_domain_dns_cdn() {
+    local domain="${1#\*.}"
+    local server_ip="${2:-$NODE_IP}"
+    log_info "Проверка DNS (Cloudflare CDN) для ${domain}..."
+    local dns_ip=""
+    if command -v dig >/dev/null 2>&1; then
+        dns_ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1 || true)
+    fi
+    if [ -z "$dns_ip" ]; then
+        dns_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}' || true)
+    fi
+    if [ -z "$dns_ip" ]; then
+        log_warning "Не удалось получить IPv4 для домена ${domain}"
+        return 1
+    fi
+    if [ "$dns_ip" = "$server_ip" ]; then
+        log_info "DNS ${domain} -> ${dns_ip} (пока напрямую; после выпуска SSL включите оранжевое облако Cloudflare + Full (strict))"
+        return 0
+    fi
+    log_success "DNS за Cloudflare CDN (Proxied): ${domain} -> ${dns_ip} (IP ноды ${server_ip} скрыт)"
     return 0
 }
 
@@ -2522,13 +2557,17 @@ install_caddy_selfsteal() {
     DETAIL_CADDY_PORT="$port"
 
     # Выбор типа сертификата: 1 = HTTP-01 (стандарт), 2 = DNS-01 (Cloudflare API Token)
-    local cert_choice="${CFG_CERT_TYPE:-1}"
+    local def_cert_choice="${CFG_CERT_TYPE:-1}"
+    if [[ "${CFG_XHTTP_CDN:-y}" =~ ^[Yy]$ ]] && [ -z "${CFG_CLOUDFLARE_TOKEN:-}" ] && [ "${CFG_CERT_TYPE:-1}" = "1" ]; then
+        def_cert_choice="2"
+    fi
+    local cert_choice="$def_cert_choice"
     local cf_token="${CFG_CLOUDFLARE_TOKEN:-}"
     if [ "${NON_INTERACTIVE:-false}" != true ]; then
-        echo -e "  ${WHITE}Способ выпуска SSL-сертификатов Let's Encrypt:${NC}"
-        echo -e "    ${ORANGE}1)${NC} Обычный HTTP-01 challenge (по умолчанию, без токенов)"
-        echo -e "    ${ORANGE}2)${NC} Cloudflare DNS-01 challenge (через Cloudflare API Token)"
-        prompt_choice "Выберите способ [1-2, Enter=1]: " 2 cert_choice "${CFG_CERT_TYPE:-1}"
+        echo -e "  ${WHITE}Способ выпуска SSL-сертификатов ACME:${NC}"
+        echo -e "    ${ORANGE}1)${NC} Обычный HTTP-01 challenge (требует серое облако на время выпуска и открытый :80)"
+        echo -e "    ${ORANGE}2)${NC} Cloudflare DNS-01 challenge ${GREEN}(рекомендуется для XHTTP за Cloudflare CDN / оранжевого облака)${NC}"
+        prompt_choice "Выберите способ [1-2, Enter=${def_cert_choice}]: " 2 cert_choice "$def_cert_choice"
     fi
     if [ "$cert_choice" = "2" ]; then
         if [ -z "$cf_token" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
@@ -2551,7 +2590,11 @@ install_caddy_selfsteal() {
     # Проверка DNS перед стартом Caddy (в интерактивном режиме)
     if [ "${NON_INTERACTIVE:-false}" != true ]; then
         validate_domain_dns "$SELF_STEAL_DOMAIN" "$NODE_IP" || true
-        validate_domain_dns "$XHTTP_STEAL_DOMAIN" "$NODE_IP" || true
+        if [[ "${CFG_XHTTP_CDN:-y}" =~ ^[Yy]$ ]]; then
+            validate_domain_dns_cdn "$XHTTP_STEAL_DOMAIN" "$NODE_IP" || true
+        else
+            validate_domain_dns "$XHTTP_STEAL_DOMAIN" "$NODE_IP" || true
+        fi
     fi
 
     # 1. Создание /opt/html/index.html и директории /opt/selfsteel
@@ -2572,6 +2615,7 @@ install_caddy_selfsteal() {
     cat > "$CADDY_DIR/.env" << EOF
 SELF_STEAL_DOMAIN=${SELF_STEAL_DOMAIN}
 XHTTP_STEAL_DOMAIN=${XHTTP_STEAL_DOMAIN}
+XHTTP_CDN=${CFG_XHTTP_CDN:-y}
 SELF_STEAL_PORT=${SELF_STEAL_PORT}
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
@@ -3194,6 +3238,12 @@ collect_api_inputs() {
             XHTTP_PATH="/${XHTTP_PATH}"
         fi
 
+        if prompt_yn "Использовать Cloudflare CDN (оранжевое облако, packet-up) для XHTTP-резерва (y/n)? " "${CFG_XHTTP_CDN:-y}"; then
+            CFG_XHTTP_CDN="y"
+        else
+            CFG_XHTTP_CDN="n"
+        fi
+
         echo -e "  ${WHITE}uTLS Fingerprint хостов в подписке (анти-детект ТСПУ):${NC}"
         echo -e "    ${ORANGE}1)${NC} randomized ${GRAPHITE}(новый uTLS-отпечаток при каждом соединении, рекомендуется)${NC}"
         echo -e "    ${ORANGE}2)${NC} chrome     ${GRAPHITE}(классический отпечаток Chrome — максимальная совместимость)${NC}"
@@ -3262,6 +3312,10 @@ automate_remnawave_api() {
     local vision_port="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
     local xhttp_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
     local host_fp="${CFG_FINGERPRINT:-randomized}"
+    local xhttp_cdn=false
+    if [[ "${CFG_XHTTP_CDN:-y}" =~ ^[Yy]$ ]]; then
+        xhttp_cdn=true
+    fi
     DETAIL_XHTTP_DOMAIN="$xhttp_dom"
 
     local cert_pair xhttp_cert_file xhttp_key_file
@@ -3307,6 +3361,7 @@ automate_remnawave_api() {
         --arg v_dom "$SELF_STEAL_DOMAIN" \
         --arg x_dom "$xhttp_dom" \
         --arg x_path "$xhttp_path" \
+        --argjson x_cdn "$xhttp_cdn" \
         --arg x_cert "$xhttp_cert_file" \
         --arg x_key "$xhttp_key_file" \
         --arg dest "127.0.0.1:${SELF_STEAL_PORT}" \
@@ -3377,10 +3432,14 @@ automate_remnawave_api() {
                             xhttpSettings: {
                                 host: $x_dom,
                                 path: $x_path,
-                                mode: "auto",
-                                extra: {
+                                mode: (if $x_cdn then "packet-up" else "auto" end),
+                                extra: (if $x_cdn then {
+                                    xPaddingBytes: "100-1000",
+                                    scMaxEachPostBytes: 1000000,
+                                    scMinPostsIntervalMs: 30
+                                } else {
                                     xPaddingBytes: "100-1000"
-                                }
+                                } end)
                             },
                             tlsSettings: {
                                 serverName: $x_dom,
@@ -3736,8 +3795,12 @@ automate_remnawave_api() {
     fi
 
     if [ -n "$xhttp_inbound_uuid" ]; then
+        local xhttp_remark="${NODE_NAME} [XHTTP]"
+        if [ "$xhttp_cdn" = true ]; then
+            xhttp_remark="${NODE_NAME} [XHTTP CDN]"
+        fi
         xhttp_host_payload=$(jq -n \
-            --arg remark "${NODE_NAME} [XHTTP]" \
+            --arg remark "$xhttp_remark" \
             --arg addr "$xhttp_dom" \
             --arg sni "$xhttp_dom" \
             --arg host_hdr "$xhttp_dom" \
@@ -3767,7 +3830,7 @@ automate_remnawave_api() {
            || xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq 'del(.nodes, .alpn)')" 2>/dev/null); then
             xhost_uuid=$(echo "$xhost_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_XHTTP_HOST_UUID="$xhost_uuid"
-            log_success "Хост XHTTP TLS создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path}, fp=${host_fp})"
+            log_success "Хост ${xhttp_remark} создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path}, fp=${host_fp})"
         else
             log_warning "Хост XHTTP (${xhttp_dom}) уже существует или требует проверки в панели."
         fi
@@ -3787,6 +3850,7 @@ XHTTP_HOST_UUID="${DETAIL_XHTTP_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
 XHTTP_STEAL_DOMAIN="${xhttp_dom}"
 XHTTP_PATH="${xhttp_path}"
+CFG_XHTTP_CDN="$([ "$xhttp_cdn" = true ] && echo "y" || echo "n")"
 CFG_FINGERPRINT="${host_fp}"
 XHTTP_CERT_FILE="${xhttp_cert_file}"
 XHTTP_KEY_FILE="${xhttp_key_file}"
@@ -4416,20 +4480,48 @@ run_verify_stack() {
     box_bottom
     echo
 
-    box_top "3/3 · DNS-ЗАПИСИ (DNS-ONLY) И CLOUDFLARE WARP"
-    local d_item
-    for d_item in "$v_dom" "$x_dom"; do
-        [ -z "$d_item" ] && continue
-        local r_ip=""
-        r_ip=$(resolve_host_to_ip "$d_item")
-        if [ "$r_ip" = "$NODE_IP" ]; then
-            box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS ${d_item} -> ${r_ip} (DNS-only, указывает прямо на ноду)"
-        elif [ -n "$r_ip" ]; then
-            box_row "${RED}${BOLD}[ FAIL ]${NC} DNS ${d_item} -> ${r_ip} (НЕ совпадает с IP ноды ${NODE_IP}! Отключите прокси Cloudflare)"
+    box_top "3/3 · DNS-ЗАПИСИ (VISION DNS-ONLY / XHTTP CDN) И CLOUDFLARE WARP"
+    local x_cdn_mode
+    x_cdn_mode=$(get_saved_xhttp_cdn)
+    if [ -n "$v_dom" ]; then
+        local vr_ip=""
+        vr_ip=$(resolve_host_to_ip "$v_dom")
+        if [ "$vr_ip" = "$NODE_IP" ]; then
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS Vision ${v_dom} -> ${vr_ip} (DNS-only, серое облако — верно для Reality)"
+        elif [ -n "$vr_ip" ]; then
+            box_row "${RED}${BOLD}[ FAIL ]${NC} DNS Vision ${v_dom} -> ${vr_ip} (НЕ совпадает с IP ноды ${NODE_IP}! Для Reality нужно серое облако)"
         else
-            box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS ${d_item}: A-запись не найдена"
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS Vision ${v_dom}: A-запись не найдена"
         fi
-    done
+    fi
+    if [ -n "$x_dom" ]; then
+        local xr_ip=""
+        xr_ip=$(resolve_host_to_ip "$x_dom")
+        if [[ "$x_cdn_mode" =~ ^[Yy]$ ]]; then
+            if [ -n "$xr_ip" ] && [ "$xr_ip" != "$NODE_IP" ]; then
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS XHTTP ${x_dom} -> ${xr_ip} (Cloudflare CDN Proxied — оранжевое облако активно)"
+                local cdn_code=""
+                cdn_code=$(curl -sS -o /dev/null -w "%{http_code}" --http2 --connect-timeout 6 --max-time 10 "https://${x_dom}/" 2>/dev/null || echo "000")
+                if [ "$cdn_code" != "000" ] && [ "$cdn_code" != "525" ] && [ "$cdn_code" != "526" ] && [ "$cdn_code" != "522" ]; then
+                    box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare CDN -> Origin E2E (https://${x_dom}/): HTTP ${cdn_code} (SSL Full strict OK)"
+                else
+                    box_row "${YELLOW}${BOLD}[ WARN ]${NC} Cloudflare CDN -> Origin E2E (https://${x_dom}/): HTTP ${cdn_code} (проверьте SSL=Full strict и сертификат XHTTP)"
+                fi
+            elif [ "$xr_ip" = "$NODE_IP" ]; then
+                box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS XHTTP ${x_dom} -> ${xr_ip} (прямой IP; включите оранжевое облако Cloudflare для CDN-резерва)"
+            else
+                box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS XHTTP ${x_dom}: A-запись не найдена"
+            fi
+        else
+            if [ "$xr_ip" = "$NODE_IP" ]; then
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS XHTTP ${x_dom} -> ${xr_ip} (DNS-only, указывает прямо на ноду)"
+            elif [ -n "$xr_ip" ]; then
+                box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS XHTTP ${x_dom} -> ${xr_ip} (отличается от IP ноды ${NODE_IP}; если это Cloudflare CDN, задайте CFG_XHTTP_CDN=y)"
+            else
+                box_row "${YELLOW}${BOLD}[ WARN ]${NC} DNS XHTTP ${x_dom}: A-запись не найдена"
+            fi
+        fi
+    fi
 
     load_warp_credentials >/dev/null 2>&1 || true
     if [ -n "${WARP_PRIVATE_KEY:-}" ]; then
@@ -4615,7 +4707,7 @@ dry_run() {
     box_kv "IP узла / SSH порт" "${NODE_ADDRESS:-$NODE_IP} | SSH: $(detect_ssh_port)/tcp"
     box_kv "Remnawave API URL" "${REMNAWAVE_API_URL:-не задан (интерактивный запрос)}"
     box_kv "Домен Vision (:10443)" "${SELF_STEAL_DOMAIN:-$(get_saved_caddy_domain)} -> Selfsteal 127.0.0.1:${SELF_STEAL_PORT}"
-    box_kv "Домен XHTTP TLS (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-auto}, certs: /certs:ro)"
+    box_kv "Домен XHTTP TLS (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-auto}, CDN=${CFG_XHTTP_CDN:-y}, certs: /certs:ro)"
     box_kv "Анти-детект (DPI/uTLS)" "fp=${CFG_FINGERPRINT:-randomized} | maxTimeDiff=300s | xPadding=100-1000 | rejectUnknownSni=true"
     box_kv "WARP AI Outbound" "CFG_ENABLE_WARP=${CFG_ENABLE_WARP:-y} (Gemini + OpenAI -> WireGuard WARP)"
     box_kv "Метод выпуска SSL" "$([ "${CFG_CERT_TYPE:-1}" = "2" ] && echo "Cloudflare DNS-01" || echo "Let's Encrypt HTTP-01 (:80)")"
@@ -4869,7 +4961,7 @@ show_status() {
     box_kv "SSH порт" "${ssh_p}/tcp"
     box_kv "IP Панели (UFW ACL)" "${panel_ip:-не привязан} -> порт ${node_p}/tcp"
     box_kv "L4 Vision (:10443)" "${caddy_dom:-не настроен} (Selfsteal 127.0.0.1:${caddy_p})"
-    box_kv "L4 XHTTP TLS (:10444)" "${xhttp_dom:-не настроен} (path: ${xhttp_p}, /certs:ro)"
+    box_kv "L4 XHTTP TLS (:10444)" "${xhttp_dom:-не настроен} (path: ${xhttp_p}, CDN=$(get_saved_xhttp_cdn), /certs:ro)"
     box_kv "WARP AI (Gemini/OpenAI)" "${WARP_PRIVATE_KEY:+активен (${WARP_ENDPOINT}${WARP_IPV6:+, ${WARP_IPV6}})}${WARP_PRIVATE_KEY:-не настроен}"
     box_kv "NetBird IP (wt0)" "${DETAIL_NETBIRD_IP:-не подключен}"
     box_kv "Мониторинг Grafana" "${DETAIL_GRAFANA_IP:+http://${DETAIL_GRAFANA_IP}:8428}${DETAIL_GRAFANA_IP:-не настроен}"
@@ -5005,6 +5097,7 @@ NODE_ADDRESS="${NODE_ADDRESS:-$NODE_IP}"
 SELF_STEAL_DOMAIN="$(get_saved_caddy_domain)"
 XHTTP_STEAL_DOMAIN="$(get_saved_xhttp_domain)"
 XHTTP_PATH="$(get_saved_xhttp_path)"
+CFG_XHTTP_CDN="$(get_saved_xhttp_cdn)"
 CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
@@ -5107,6 +5200,7 @@ show_help() {
     SELF_STEAL_DOMAIN="nl1.example.com"
     XHTTP_STEAL_DOMAIN="x-nl1.example.com"
     XHTTP_PATH="/api/v2/telemetry/a1b2c3d4" # по умолчанию генерируется уникальный путь
+    CFG_XHTTP_CDN="y"                       # y = Cloudflare CDN резерв (оранжевое облако, mode: packet-up)
     CFG_FINGERPRINT="randomized"            # randomized | chrome | firefox | ios
     SELF_STEAL_PORT="9443"
     CFG_ENABLE_WARP="y"          # y = маршрутизировать Gemini + OpenAI через WARP WireGuard

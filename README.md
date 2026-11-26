@@ -2,9 +2,9 @@
 
 # 🦊 LissVPN Node Orchestrator (`node-mgr`)
 
-**Production-ready оркестратор v4.2, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS с пробросом `/certs:ro`), Anti-Detect DPI/uTLS твики (`randomized` fp, уникальный `XHTTP_PATH`, `xPaddingBytes`, `maxTimeDiff`, `rejectUnknownSni`, Captive Portal `DIRECT`), авто-регистратор Cloudflare WARP (Gemini + OpenAI/ChatGPT), E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
+**Production-ready оркестратор v4.3, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS Cloudflare CDN-резерв с `/certs:ro`), Anti-Detect DPI/uTLS твики, авто-регистратор Cloudflare WARP (Gemini + OpenAI/ChatGPT), E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
 
-[![Version](https://img.shields.io/badge/version-v4.2.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
+[![Version](https://img.shields.io/badge/version-v4.3.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
 [![OS](https://img.shields.io/badge/Ubuntu_22.04%2F24.04_%7C_Debian_11%2F12-151419?style=for-the-badge&logo=debian&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Docker](https://img.shields.io/badge/Docker_Compose_v2_+_Caddy_L4-151419?style=for-the-badge&logo=docker&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Security](https://img.shields.io/badge/UFW_+_Fail2ban_+_nftables-Strict_ACL-2ECC71?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
@@ -13,9 +13,13 @@
 
 ---
 
-## ⚡ Что нового в версии v4.2
+## ⚡ Что нового в версии v4.3
 
-* **🛡️ Anti-Detect пакет против эвристики ТСПУ и активного пробинга:**
+* **☁️ VLESS XHTTP TLS как Cloudflare CDN-резерв (оранжевое облако, `CFG_XHTTP_CDN=y`):**
+  * **Vision (`SELF_STEAL_DOMAIN`)** остаётся на прямом IP (серое облако DNS-only) для максимальной скорости и минимального пинга.
+  * **XHTTP (`XHTTP_STEAL_DOMAIN`)** настраивается для работы за **Cloudflare CDN (Proxied / оранжевое облако)**: `mode: "packet-up"`, `scMaxEachPostBytes: 1000000`, `scMinPostsIntervalMs: 30`, `xPaddingBytes: "100-1000"`, SSL/TLS `Full (strict)` с реальным сертификатом `/certs:ro` и хостом `[XHTTP CDN]` в панели Remnawave.
+  * При `CFG_XHTTP_CDN=y` мастер рекомендует **Cloudflare DNS-01** (выпуск и продление сертификатов работают при включённом оранжевом облаке), а `node-mgr verify` отдельно проверяет DNS-only для Vision и живой сквозной HTTPS-маршрут **Cloudflare CDN -> Caddy L4 -> Xray XHTTP** (ловит `525/526/522`).
+* **🛡️ Anti-Detect пакет против эвристики ТСПУ и активного пробинга (v4.2):**
   * **Выбор uTLS Fingerprint (`CFG_FINGERPRINT`):** в мастере и API-хостах (`/api/hosts`) по умолчанию используется `randomized` (генерация свежего ClientHello при каждом подключении вместо статичного `chrome`, с возможностью выбрать `chrome`, `firefox`, `ios`).
   * **Уникальный `XHTTP_PATH` для каждой ноды:** вместо одного шаблона `/api/v3/sync/r1` генерируется индивидуальный правдоподобный путь (`/api/v2/telemetry/<hex>`, `/cdn/assets/v1/<hex>` и др.) с сохранением в стейте и конфиге.
   * **Усиление XHTTP + TLS + Reality:** добавлены `xhttpSettings.extra.xPaddingBytes: "100-1000"` (рандомизация размеров HTTP-пакетов), `tlsSettings.rejectUnknownSni: true` и `realitySettings.maxTimeDiff: 300000` (anti-replay окно 5 минут).
