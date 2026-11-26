@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.3.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.4.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.3.0"
+readonly SCRIPT_VERSION="4.4.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -58,12 +58,15 @@ readonly REMNANODE_DATA_DIR="/var/lib/remnanode"
 readonly CADDY_DIR="${INSTALL_DIR}/selfsteel"
 readonly CADDY_HTML_DIR="${INSTALL_DIR}/html"
 readonly MONITORING_DIR="${INSTALL_DIR}/monitoring"
+readonly WARP_DIR="${INSTALL_DIR}/warp"
 readonly CADDY_CONTAINER_NAME="caddy-remnawave"
+readonly WARP_CONTAINER_NAME="warp-proxy"
 readonly CADDY_DATA_VOL="selfsteel_caddy_data_selfsteal"
 readonly CADDY_CONFIG_VOL="selfsteel_caddy_config_selfsteal"
 readonly DEFAULT_PORT="9443"
 readonly DEFAULT_VISION_PORT="10443"
 readonly DEFAULT_XHTTP_PORT="10444"
+readonly DEFAULT_WARP_SOCKS_PORT="40000"
 readonly DEFAULT_XHTTP_PATH="/api/v3/sync/r1"
 
 CADVISOR_VERSION="0.53.0"
@@ -112,8 +115,12 @@ SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
 VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
 XHTTP_INBOUND_PORT="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
 
-# Cloudflare WARP WireGuard (маршрутизация Gemini + OpenAI/ChatGPT)
+# Cloudflare WARP SOCKS5 Proxy (caomingjun/warp -> 127.0.0.1:40000 для Gemini + OpenAI/ChatGPT)
 CFG_ENABLE_WARP="${CFG_ENABLE_WARP:-y}"
+WARP_SOCKS_PORT="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
+WARP_EXIT_IP=""
+WARP_COLO=""
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"
 WARP_IPV6="${WARP_IPV6:-}"
 WARP_RESERVED="${WARP_RESERVED:-}"
@@ -829,7 +836,7 @@ load_config_file() {
             log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
         fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_SOCKS_PORT WARP_LICENSE_KEY WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -1421,16 +1428,20 @@ EOF
         _mark_finding "NEED_MSS"
     fi
 
-    # 31. Туннели, WARP (Gemini/OpenAI), NetBird и стек мониторинга
+    # 31. Туннели, WARP SOCKS5 (Gemini/OpenAI), NetBird и стек мониторинга
     local tun_info=()
-    if [ -f "$WARP_STATE_FILE" ]; then
-        local w_v6=""
-        w_v6=$(grep -E '^WARP_IPV6=' "$WARP_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
-        if grep -qE '^WARP_PRIVATE_KEY=.+' "$WARP_STATE_FILE" 2>/dev/null; then
-            tun_info+=("WARP:OK(${w_v6:-WG})")
+    if is_container_running "$WARP_CONTAINER_NAME"; then
+        local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}" w_tr=""
+        w_tr=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 4 --max-time 6 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+        if echo "$w_tr" | grep -qE '^warp=(on|plus)'; then
+            local w_colo
+            w_colo=$(echo "$w_tr" | awk -F= '/^colo=/{print $2; exit}')
+            tun_info+=("WARP:OK(127.0.0.1:${w_port}/${w_colo:-CF})")
         else
-            tun_info+=("WARP:WARN(empty)")
+            tun_info+=("WARP:WARN(not-connected)")
         fi
+    elif [ -d "$WARP_DIR" ]; then
+        tun_info+=("WARP:WARN(stopped)")
     fi
     if command -v netbird >/dev/null 2>&1; then
         local nb_st=0
@@ -3083,31 +3094,141 @@ EOF
     return 0
 }
 
+# ── Развертывание локального Cloudflare WARP SOCKS5 (caomingjun/warp -> 127.0.0.1:40000) ─
+deploy_warp_proxy() {
+    local force_recreate="${1:-}"
+    local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+
+    # Быстрая проверка: если контейнер уже работает и реально выдаёт warp=on — не пересоздаём
+    if [ "$force_recreate" != "--force" ] && is_container_running "$WARP_CONTAINER_NAME"; then
+        local live_trace=""
+        live_trace=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 5 --max-time 10 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+        if echo "$live_trace" | grep -qE '^warp=(on|plus)'; then
+            WARP_EXIT_IP=$(echo "$live_trace" | awk -F= '/^ip=/{print $2; exit}')
+            WARP_COLO=$(echo "$live_trace" | awk -F= '/^colo=/{print $2; exit}')
+            DETAIL_WARP_IPV6="$WARP_EXIT_IP"
+            STATUS_WARP="активен (SOCKS5 127.0.0.1:${w_port})"
+            log_success "Cloudflare WARP SOCKS5 уже активен на 127.0.0.1:${w_port} (warp=on, IP: ${WARP_EXIT_IP:-?}, colo: ${WARP_COLO:-?})"
+            return 0
+        fi
+    fi
+
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        log_warning "Docker не запущен — установка контейнера ${WARP_CONTAINER_NAME} невозможна."
+        STATUS_WARP="ошибка (нет Docker)"
+        return 1
+    fi
+
+    mkdir -p "$WARP_DIR/data"
+    if [ "$force_recreate" = "--force" ]; then
+        docker compose --project-directory "$WARP_DIR" down 2>/dev/null || true
+        rm -rf "$WARP_DIR/data"/* 2>/dev/null || true
+    fi
+
+    local ipv6_sysctl=""
+    if [ -d /proc/sys/net/ipv6 ]; then
+        ipv6_sysctl="      - net.ipv6.conf.all.disable_ipv6=0"
+    fi
+
+    local license_env=""
+    if [ -n "${WARP_LICENSE_KEY:-}" ]; then
+        license_env="      - WARP_LICENSE_KEY=${WARP_LICENSE_KEY}"
+    fi
+
+    cat > "$WARP_DIR/docker-compose.yml" << EOF
+services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: ${WARP_CONTAINER_NAME}
+    restart: unless-stopped
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    ports:
+      - "127.0.0.1:${w_port}:1080"
+    environment:
+      - WARP_SLEEP=2
+${license_env}
+    cap_add:
+      - NET_ADMIN
+      - MKNOD
+      - AUDIT_WRITE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+${ipv6_sysctl}
+    volumes:
+      - ./data:/var/lib/cloudflare-warp
+EOF
+
+    log_info "Запуск Cloudflare WARP SOCKS5 контейнера (caomingjun/warp -> 127.0.0.1:${w_port})..."
+    docker rm -f "$WARP_CONTAINER_NAME" 2>/dev/null || true
+    docker compose --project-directory "$WARP_DIR" pull --quiet 2>/dev/null || true
+    if ! docker compose --project-directory "$WARP_DIR" up -d --remove-orphans; then
+        log_error "Не удалось запустить контейнер ${WARP_CONTAINER_NAME}!"
+        STATUS_WARP="ошибка запуска"
+        return 1
+    fi
+
+    # Живая проверка туннеля через https://www.cloudflare.com/cdn-cgi/trace (до 45с)
+    log_info "Ожидание подключения Cloudflare WARP (проверка warp=on через 127.0.0.1:${w_port})..."
+    local waited=0 trace_out=""
+    while [ $waited -lt 45 ]; do
+        trace_out=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 4 --max-time 8 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+        if echo "$trace_out" | grep -qE '^warp=(on|plus)'; then
+            WARP_EXIT_IP=$(echo "$trace_out" | awk -F= '/^ip=/{print $2; exit}')
+            WARP_COLO=$(echo "$trace_out" | awk -F= '/^colo=/{print $2; exit}')
+            DETAIL_WARP_IPV6="$WARP_EXIT_IP"
+            STATUS_WARP="активен (SOCKS5 127.0.0.1:${w_port})"
+
+            umask 077
+            cat > "$WARP_STATE_FILE" << EOF
+WARP_MODE="socks5"
+WARP_SOCKS_PORT="${w_port}"
+WARP_EXIT_IP="${WARP_EXIT_IP}"
+WARP_COLO="${WARP_COLO}"
+EOF
+            chmod 600 "$WARP_STATE_FILE"
+            umask 022
+
+            log_success "Cloudflare WARP SOCKS5 работает: 127.0.0.1:${w_port} (warp=on | IP: ${WARP_EXIT_IP:-?} | DC: ${WARP_COLO:-?})"
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    log_warning "Таймаут ожидания warp=on на 127.0.0.1:${w_port}. Последние логи ${WARP_CONTAINER_NAME}:"
+    docker logs --tail 20 "$WARP_CONTAINER_NAME" 2>&1 | sed 's/^/    /' || true
+    STATUS_WARP="ошибка (нет warp=on)"
+    return 1
+}
+
 configure_warp_routing() {
     _init_env
-    print_header "CLOUDFLARE WARP WIREGUARD (GEMINI + OPENAI / CHATGPT)"
+    print_header "CLOUDFLARE WARP SOCKS5 PROXY (GEMINI + OPENAI / CHATGPT)"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        install_docker && check_docker_compose || return 1
+    fi
 
     local force_arg=""
-    if [ -f "$WARP_STATE_FILE" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
-        load_warp_credentials >/dev/null 2>&1 || true
-        log_info "Текущие учетные данные WARP найдены в ${WARP_STATE_FILE} (IPv6: ${WARP_IPV6:-n/a})"
-        if prompt_yn "Перерегистрировать новое устройство Cloudflare WARP? (y/n): " "n"; then
+    if is_container_running "$WARP_CONTAINER_NAME" && [ "${NON_INTERACTIVE:-false}" != true ]; then
+        log_info "Контейнер ${WARP_CONTAINER_NAME} уже запущен (127.0.0.1:${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT})."
+        if prompt_yn "Перерегистрировать и пересоздать контейнер Cloudflare WARP? (y/n): " "n"; then
             force_arg="--force"
         fi
     fi
 
-    if ensure_warp_credentials "$force_arg"; then
-        local res_json="[]"
-        if [[ "${WARP_RESERVED:-}" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
-            res_json="[${WARP_RESERVED}]"
-        fi
-        box_top "ПАРАМЕТРЫ XRAY WIREGUARD OUTBOUND (WARP)"
-        box_kv "State-файл (chmod 600)" "$WARP_STATE_FILE"
-        box_kv "Endpoint" "$WARP_ENDPOINT"
-        box_kv "Address (IPv4 / IPv6)" "172.16.0.2/32${WARP_IPV6:+, ${WARP_IPV6}/128}"
-        box_kv "Reserved bytes" "$res_json"
+    if deploy_warp_proxy "$force_arg"; then
+        local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+        box_top "ПАРАМЕТРЫ XRAY OUTBOUND 'WARP' (SOCKS5 -> CLOUDFLARE WARP)"
+        box_kv "Контейнер" "${WARP_CONTAINER_NAME} (caomingjun/warp:latest)"
+        box_kv "Локальный SOCKS5" "127.0.0.1:${w_port} (закрыт от внешнего мира)"
+        box_kv "Статус Cloudflare" "warp=on | Exit IP: ${WARP_EXIT_IP:-?} | DC: ${WARP_COLO:-?}"
         box_kv "AI-домены -> WARP" "Gemini, Google AI Studio, NotebookLM, ChatGPT, OpenAI, Sora"
         box_bottom
+        echo
+        echo -e "  ${WHITE}Блок для outbounds в Config Profile панели Remnawave:${NC}"
+        echo -e "  ${CYAN}{\"tag\": \"WARP\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": ${w_port}}]}}${NC}"
         echo
         if [ -f "$API_STATE_FILE" ] && [ -n "${REMNAWAVE_API_TOKEN:-}" ] && [ -n "${REMNAWAVE_API_URL:-}" ]; then
             log_info "Чтобы сразу обновить Config Profile на панели, запустите: node-mgr auto-deploy"
@@ -3330,10 +3451,11 @@ automate_remnawave_api() {
     local vision_tag="VLESS_REALITY_${upper_node_name:-NODE}"
     local xhttp_tag="VLESS_XHTTP_${upper_node_name:-NODE}"
 
-    # Авто-регистрация WARP WireGuard (если включен для Gemini + OpenAI/ChatGPT)
+    # Развертывание локального Cloudflare WARP SOCKS5 (caomingjun/warp -> 127.0.0.1:40000) для Gemini + OpenAI
     local warp_active=false
+    local warp_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
     if [[ "${CFG_ENABLE_WARP:-y}" =~ ^[Yy]$ ]]; then
-        if ensure_warp_credentials; then
+        if deploy_warp_proxy; then
             warp_active=true
         fi
     else
@@ -3348,10 +3470,10 @@ automate_remnawave_api() {
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4e5f60718")
 
     # ── ШАГ 1: Создание или обновление Config Profile (/api/config-profiles) ─
-    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}' (Vision :${vision_port} + XHTTP TLS :${xhttp_port}${warp_active:+ + WARP AI})..."
+    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}' (Vision :${vision_port} + XHTTP TLS :${xhttp_port}${warp_active:+ + WARP SOCKS5 :${warp_port}})..."
     local profile_payload profile_resp="" profile_uuid="" vision_inbound_uuid="" xhttp_inbound_uuid=""
 
-    # Формируем JSON с двумя инбаундами за Caddy L4 и опциональным WARP WireGuard outbound для Gemini + OpenAI
+    # Формируем JSON с двумя инбаундами за Caddy L4 и опциональным WARP SOCKS5 outbound (127.0.0.1:40000)
     profile_payload=$(jq -n \
         --arg name "$profile_name" \
         --arg v_tag "$vision_tag" \
@@ -3368,10 +3490,7 @@ automate_remnawave_api() {
         --arg pk "$priv_key" \
         --arg sid "$short_id" \
         --argjson use_warp "$warp_active" \
-        --arg w_priv "${WARP_PRIVATE_KEY:-}" \
-        --arg w_v6 "${WARP_IPV6:-}" \
-        --arg w_pub "${WARP_PUBLIC_KEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}" \
-        --arg w_ep "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" \
+        --argjson w_port "$warp_port" \
         '{
             name: $name,
             config: {
@@ -3469,20 +3588,14 @@ automate_remnawave_api() {
                     ] + (if $use_warp then [
                         {
                             tag: "WARP",
-                            protocol: "wireguard",
+                            protocol: "socks",
                             settings: {
-                                secretKey: $w_priv,
-                                address: (if $w_v6 != "" then ["172.16.0.2/32", ($w_v6 + "/128")] else ["172.16.0.2/32"] end),
-                                noKernelTun: true,
-                                peers: [
+                                servers: [
                                     {
-                                        publicKey: $w_pub,
-                                        allowedIPs: ["0.0.0.0/0", "::/0"],
-                                        endpoint: $w_ep
+                                        address: "127.0.0.1",
+                                        port: $w_port
                                     }
-                                ],
-                                mtu: 1280,
-                                domainStrategy: "ForceIPv4"
+                                ]
                             }
                         }
                     ] else [] end)
@@ -4523,11 +4636,20 @@ run_verify_stack() {
         fi
     fi
 
-    load_warp_credentials >/dev/null 2>&1 || true
-    if [ -n "${WARP_PRIVATE_KEY:-}" ]; then
-        box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare WARP WireGuard готов (${WARP_ENDPOINT}, IPv6: ${WARP_IPV6:-n/a})"
+    local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+    if is_container_running "$WARP_CONTAINER_NAME"; then
+        local w_trace=""
+        w_trace=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 6 --max-time 10 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+        if echo "$w_trace" | grep -qE '^warp=(on|plus)'; then
+            local w_ip w_colo
+            w_ip=$(echo "$w_trace" | awk -F= '/^ip=/{print $2; exit}')
+            w_colo=$(echo "$w_trace" | awk -F= '/^colo=/{print $2; exit}')
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare WARP SOCKS5 (127.0.0.1:${w_port}): warp=on (IP: ${w_ip:-?}, DC: ${w_colo:-?})"
+        else
+            box_row "${RED}${BOLD}[ FAIL ]${NC} Контейнер ${WARP_CONTAINER_NAME} запущен, но SOCKS5 127.0.0.1:${w_port} не отвечает warp=on (node-mgr logs warp)"
+        fi
     else
-        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Cloudflare WARP WireGuard не зарегистрирован (node-mgr warp)"
+        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Cloudflare WARP SOCKS5 (${WARP_CONTAINER_NAME}) не запущен (запустите: node-mgr warp)"
     fi
     box_bottom
     echo
@@ -4899,6 +5021,9 @@ show_logs() {
                 docker logs -f --tail=100 caddy-selfsteal
             fi
             ;;
+        warp|warp-proxy)
+            docker logs -f --tail=100 "$WARP_CONTAINER_NAME"
+            ;;
         monitoring|vmagent|cadvisor)
             docker compose --project-directory "$MONITORING_DIR" logs -f --tail=100
             ;;
@@ -4906,7 +5031,7 @@ show_logs() {
             journalctl -u fail2ban -n 100 -f
             ;;
         *)
-            log_error "Использование: node-mgr logs {node|caddy|monitoring|f2b}"
+            log_error "Использование: node-mgr logs {node|caddy|warp|monitoring|f2b}"
             ;;
     esac
 }
@@ -4962,7 +5087,11 @@ show_status() {
     box_kv "IP Панели (UFW ACL)" "${panel_ip:-не привязан} -> порт ${node_p}/tcp"
     box_kv "L4 Vision (:10443)" "${caddy_dom:-не настроен} (Selfsteal 127.0.0.1:${caddy_p})"
     box_kv "L4 XHTTP TLS (:10444)" "${xhttp_dom:-не настроен} (path: ${xhttp_p}, CDN=$(get_saved_xhttp_cdn), /certs:ro)"
-    box_kv "WARP AI (Gemini/OpenAI)" "${WARP_PRIVATE_KEY:+активен (${WARP_ENDPOINT}${WARP_IPV6:+, ${WARP_IPV6}})}${WARP_PRIVATE_KEY:-не настроен}"
+    local w_status_str="не запущен"
+    if is_container_running "$WARP_CONTAINER_NAME"; then
+        w_status_str="SOCKS5 127.0.0.1:${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT} (${WARP_CONTAINER_NAME})"
+    fi
+    box_kv "WARP AI (Gemini/OpenAI)" "$w_status_str"
     box_kv "NetBird IP (wt0)" "${DETAIL_NETBIRD_IP:-не подключен}"
     box_kv "Мониторинг Grafana" "${DETAIL_GRAFANA_IP:+http://${DETAIL_GRAFANA_IP}:8428}${DETAIL_GRAFANA_IP:-не настроен}"
     box_bottom
@@ -4985,6 +5114,14 @@ show_status() {
         box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${CADDY_CONTAINER_NAME} (Selfsteal 127.0.0.1:${caddy_p})"
     else
         box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер ${CADDY_CONTAINER_NAME}"
+    fi
+
+    if is_container_running "$WARP_CONTAINER_NAME"; then
+        box_row "${GREEN}${BOLD}[ RUNNING ]${NC} Контейнер ${WARP_CONTAINER_NAME} (WARP SOCKS5 127.0.0.1:${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT})"
+    elif [ -d "$WARP_DIR" ]; then
+        box_row "${YELLOW}${BOLD}[ STOPPED ]${NC} Контейнер ${WARP_CONTAINER_NAME}"
+    else
+        box_row "${GRAPHITE}[ NOT SET ]${NC} Cloudflare WARP SOCKS5 (node-mgr warp)"
     fi
 
     if is_container_running "vmagent" && is_container_running "node-exporter" && is_container_running "cadvisor"; then
@@ -5058,6 +5195,11 @@ update_components() {
         fi
         docker compose --project-directory "$CADDY_DIR" up -d --remove-orphans
     fi
+    if [ -f "$WARP_DIR/docker-compose.yml" ]; then
+        log_info "Обновление образа Cloudflare WARP SOCKS5 (${WARP_CONTAINER_NAME})..."
+        docker compose --project-directory "$WARP_DIR" pull
+        docker compose --project-directory "$WARP_DIR" up -d --remove-orphans
+    fi
     if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
         log_info "Обновление версий и образов стека мониторинга (cAdvisor / node-exporter / vmagent)..."
         update_component_versions
@@ -5103,11 +5245,8 @@ SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
 CFG_ENABLE_WARP="${CFG_ENABLE_WARP:-y}"
-WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY}"
-WARP_IPV6="${WARP_IPV6}"
-WARP_RESERVED="${WARP_RESERVED}"
-WARP_ENDPOINT="${WARP_ENDPOINT}"
-WARP_PUBLIC_KEY="${WARP_PUBLIC_KEY}"
+WARP_SOCKS_PORT="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+WARP_LICENSE_KEY="${WARP_LICENSE_KEY}"
 CFG_CERT_TYPE="${CFG_CERT_TYPE:-1}"
 CFG_CLOUDFLARE_TOKEN="${CFG_CLOUDFLARE_TOKEN}"
 CFG_SECRET_KEY="${cfg_secret}"
@@ -5142,10 +5281,13 @@ uninstall_all() {
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
     fi
+    if [ -f "$WARP_DIR/docker-compose.yml" ]; then
+        docker compose --project-directory "$WARP_DIR" down 2>/dev/null || true
+    fi
     if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
         docker compose --project-directory "$MONITORING_DIR" down 2>/dev/null || true
     fi
-    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal cadvisor node-exporter vmagent 2>/dev/null || true
+    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal "$WARP_CONTAINER_NAME" cadvisor node-exporter vmagent 2>/dev/null || true
 
     if systemctl is-active --quiet portscan-detect.service 2>/dev/null; then
         systemctl disable --now portscan-detect.service 2>/dev/null || true
@@ -5156,7 +5298,7 @@ uninstall_all() {
     rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-status.conf /etc/fail2ban/filter.d/portscan.conf
     systemctl restart fail2ban 2>/dev/null || true
 
-    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" "$CADDY_HTML_DIR" "$MONITORING_DIR" "$PROTECT_OUT_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
+    rm -rf "$REMNANODE_DIR" "$REMNANODE_DATA_DIR" "$CADDY_DIR" "$CADDY_HTML_DIR" "$WARP_DIR" "$MONITORING_DIR" "$PROTECT_OUT_DIR" /var/log/remnanode /etc/logrotate.d/remnanode
     log_success "Все компоненты узла удалены."
 }
 
@@ -5173,13 +5315,13 @@ show_help() {
     optimize [--all|--from-findings|--zram|--shaper [MBIT]|--sysctl|--rps|--nic|--mss]
                                  Тюнинг ядра, BBR + sch_cake/fq, FD, RPS/XPS, NIC (LRO off), TCPMSS, Zram, Shaper
     shape [MBIT]                 Включить CAKE Traffic Shaper (dual-srchost) для защиты от перегрузки канала
-    warp                         Авто-регистрация Cloudflare WARP WireGuard (маршрутизация Gemini + OpenAI)
+    warp                         Запуск контейнера Cloudflare WARP SOCKS5 (127.0.0.1:40000 для Gemini + OpenAI)
     protect                      Генерация защитных конфигов nftables (anti-DDoS) и sshd hardening
     bbr3                         Установка ядра XanMod с поддержкой BBRv3 (с проверкой релиза и GPG)
     rollback                     Откат всех наложенных оптимизаций
     status                       Показать состояние узла, контейнеров, WARP, NetBird и мониторинга
-    logs {node|caddy|monitoring|f2b}
-                                 Просмотр логов RemnaNode, Caddy, Мониторинга или Fail2ban
+    logs {node|caddy|warp|monitoring|f2b}
+                                 Просмотр логов RemnaNode, Caddy, WARP, Мониторинга или Fail2ban
     install                      Установка ноды (с выбором API или ручного режима)
     selective                    Выборочная установка модулей (включая Caddy L4, WARP, NetBird, Monitoring)
     netbird                      Установка и подключение NetBird Mesh VPN по Setup Key

@@ -2,9 +2,9 @@
 
 # 🦊 LissVPN Node Orchestrator (`node-mgr`)
 
-**Production-ready оркестратор v4.3, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS Cloudflare CDN-резерв с `/certs:ro`), Anti-Detect DPI/uTLS твики, авто-регистратор Cloudflare WARP (Gemini + OpenAI/ChatGPT), E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
+**Production-ready оркестратор v4.4, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS Cloudflare CDN-резерв с `/certs:ro`), локальный Cloudflare WARP SOCKS5 (`caomingjun/warp` -> `127.0.0.1:40000` для Gemini + OpenAI/ChatGPT), Anti-Detect DPI/uTLS твики, E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
 
-[![Version](https://img.shields.io/badge/version-v4.3.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
+[![Version](https://img.shields.io/badge/version-v4.4.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
 [![OS](https://img.shields.io/badge/Ubuntu_22.04%2F24.04_%7C_Debian_11%2F12-151419?style=for-the-badge&logo=debian&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Docker](https://img.shields.io/badge/Docker_Compose_v2_+_Caddy_L4-151419?style=for-the-badge&logo=docker&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Security](https://img.shields.io/badge/UFW_+_Fail2ban_+_nftables-Strict_ACL-2ECC71?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
@@ -30,9 +30,9 @@
     * `SELF_STEAL_DOMAIN` ──► `127.0.0.1:10443` (**VLESS Reality Vision** ──► fallback `127.0.0.1:9443`).
     * `XHTTP_STEAL_DOMAIN` ──► `127.0.0.1:10444` (**VLESS XHTTP + TLS**, который использует реальные SSL-сертификаты Let's Encrypt от Caddy из тома `${CADDY_DATA_VOL}:/certs:ro`).
     * Любой другой SNI / IP-скан ──► `127.0.0.1:9443` (catch-all `HTTP 204`).
-* **🌐 Cloudflare WARP WireGuard outbound (`WARP`) для Gemini и OpenAI/ChatGPT:**
-  * Во время развертывания (или командой `node-mgr warp`) автоматически генерируется WireGuard X25519-ключ и регистрируется бесплатный WARP-аккаунт в Cloudflare API с сохранением в `/var/lib/node-mgr/warp.env` (`chmod 600`).
-  * В Config Profile панели добавляется нативный outbound `WARP` (`protocol: "wireguard"`, `mtu: 1280`) и правила маршрутизации для доменов **Gemini**, **Google AI Studio**, **NotebookLM**, **ChatGPT**, **OpenAI** и **Sora**.
+* **🌐 Надёжный Cloudflare WARP SOCKS5 (`caomingjun/warp` -> `127.0.0.1:40000`) для Gemini и OpenAI/ChatGPT (v4.4):**
+  * Вместо хрупкого Xray WireGuard (где схема редактора панели блокирует поле `reserved`, без которого Cloudflare отбрасывает рукопожатия) запускается изолированный контейнер `warp-proxy` (`caomingjun/warp:latest`) с официальным клиентом Cloudflare WARP, доступный **строго локально на `127.0.0.1:40000`**.
+  * В Config Profile панели добавляется стандартный `protocol: "socks"` outbound `WARP` (`127.0.0.1:40000`) — 0 ошибок схемы, без `rp_filter` и проблем с `reserved`. При деплое и в `node-mgr verify` выполняется живая проверка `warp=on` через `cloudflare.com/cdn-cgi/trace`.
 * **🔬 Сквозной E2E-верификатор рукопожатий (`node-mgr verify`):**
   * Проверка `Caddy L4 (:443)` ──► `Xray Vision (:10443)` ──► `Selfsteal (:9443)` и реального TLS-рукопожатия `Caddy L4 (:443)` ──► `XHTTP TLS (:10444)` с проверкой читаемости сертификатов в `remnanode:/certs:ro`.
   * Имитация активного пробинга сканером с чужим SNI (`scanner-probe.invalid:443`) -> `HTTP 204`.
