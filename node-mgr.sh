@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.1 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.7.0"
+readonly SCRIPT_VERSION="4.7.1"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -4841,7 +4841,7 @@ EOF
     cat > "$MONITORING_DIR/docker-compose.yml" << EOF
 services:
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v${CADVISOR_VERSION}
+    image: ghcr.io/google/cadvisor:v${CADVISOR_VERSION}
     container_name: cadvisor
     restart: unless-stopped
     network_mode: host
@@ -5018,7 +5018,8 @@ run_verify_stack() {
     if [ -n "$x_dom" ]; then
         local x_code=""
         x_code=$(curl -sS -o /dev/null -w "%{http_code}" --http2 --tlsv1.2 --connect-timeout 5 --max-time 8 \
-            --resolve "${x_dom}:443:127.0.0.1" "https://${x_dom}/" 2>/dev/null || echo "000")
+            --resolve "${x_dom}:443:127.0.0.1" "https://${x_dom}/" 2>/dev/null || true)
+        x_code="${x_code:-000}"
         if [ "$(get_saved_node_role)" = "relay" ]; then
             if [ "$x_code" = "200" ]; then
                 box_row "${GREEN}${BOLD}[ PASS ]${NC} L4 -> XHTTP Reality Fallback E2E (${x_dom}:443 -> :${x_port} -> :${c_port}): HTTP 200"
@@ -5036,7 +5037,8 @@ run_verify_stack() {
 
     local scan_probe=""
     scan_probe=$(curl -k -sS -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 6 \
-        --resolve "scanner-probe.invalid:443:127.0.0.1" "https://scanner-probe.invalid/" 2>/dev/null || echo "000")
+        --resolve "scanner-probe.invalid:443:127.0.0.1" "https://scanner-probe.invalid/" 2>/dev/null || true)
+    scan_probe="${scan_probe:-000}"
     if [ "$scan_probe" = "204" ] || [ "$scan_probe" = "000" ]; then
         box_row "${GREEN}${BOLD}[ PASS ]${NC} Защита от сканеров (чужой SNI :443 -> catch-all): HTTP ${scan_probe} (домены скрыты)"
     else
@@ -5066,7 +5068,8 @@ run_verify_stack() {
             if [ -n "$xr_ip" ] && [ "$xr_ip" != "$NODE_IP" ]; then
                 box_row "${GREEN}${BOLD}[ PASS ]${NC} DNS XHTTP ${x_dom} -> ${xr_ip} (Cloudflare CDN Proxied — оранжевое облако активно)"
                 local cdn_code=""
-                cdn_code=$(curl -sS -o /dev/null -w "%{http_code}" --http2 --connect-timeout 6 --max-time 10 "https://${x_dom}/" 2>/dev/null || echo "000")
+                cdn_code=$(curl -sS -o /dev/null -w "%{http_code}" --http2 --connect-timeout 6 --max-time 10 "https://${x_dom}/" 2>/dev/null || true)
+                cdn_code="${cdn_code:-000}"
                 if [ "$cdn_code" != "000" ] && [ "$cdn_code" != "525" ] && [ "$cdn_code" != "526" ] && [ "$cdn_code" != "522" ]; then
                     box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare CDN -> Origin E2E (https://${x_dom}/): HTTP ${cdn_code} (SSL Full strict OK)"
                 else
@@ -5688,7 +5691,7 @@ update_components() {
     if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
         log_info "Обновление версий и образов стека мониторинга (cAdvisor / node-exporter / vmagent)..."
         update_component_versions
-        sed -i -E "s|gcr.io/cadvisor/cadvisor:v[0-9.]+|gcr.io/cadvisor/cadvisor:v${CADVISOR_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
+        sed -i -E "s|(gcr\.io/cadvisor/cadvisor|ghcr\.io/google/cadvisor):v[0-9.]+|ghcr.io/google/cadvisor:v${CADVISOR_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
         sed -i -E "s|prom/node-exporter:v[0-9.]+|prom/node-exporter:v${NODE_EXPORTER_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
         sed -i -E "s|victoriametrics/vmagent:v[0-9.]+|victoriametrics/vmagent:v${VMAGENT_VERSION}|g" "$MONITORING_DIR/docker-compose.yml" 2>/dev/null || true
         docker compose --project-directory "$MONITORING_DIR" pull
@@ -5783,7 +5786,7 @@ uninstall_all() {
     if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
         docker compose --project-directory "$MONITORING_DIR" down 2>/dev/null || true
     fi
-    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal "$WARP_CONTAINER_NAME" cadvisor node-exporter vmagent 2>/dev/null || true
+    docker rm -f remnanode "$CADDY_CONTAINER_NAME" caddy-selfsteal selfsteal-caddy "$WARP_CONTAINER_NAME" cadvisor node-exporter vmagent 2>/dev/null || true
 
     if systemctl is-active --quiet portscan-detect.service 2>/dev/null; then
         systemctl disable --now portscan-detect.service 2>/dev/null || true
