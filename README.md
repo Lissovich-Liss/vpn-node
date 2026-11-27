@@ -2,9 +2,9 @@
 
 # 🦊 LissVPN Node Orchestrator (`node-mgr`)
 
-**Production-ready оркестратор v4.6, автоматизатор Remnawave API (Exit Node + РФ-мост / Relay Mode с прямым YouTube и .ru, Caddy L4 с `PROXY protocol v1`, VLESS Reality Vision `xver: 1` + VLESS XHTTP TLS Cloudflare CDN-резерв), авто-закрытие `:80` при DNS-01, `node-mgr ssh-port`, локальный Cloudflare WARP SOCKS5 для Gemini и всех ИИ, Anti-Detect DPI/uTLS, E2E-тестер, Highload BBR + CAKE Shaper и 33-точечная диагностика**
+**Production-ready оркестратор v4.7, автоматизатор Remnawave API (Exit Node + РФ-мост / Relay Mode с `AsIs` + DoH без DNS-утечек, `XHTTP + Reality` `stream-one` + `xmux`, тегированием хостов для автовыбора `injectHosts`, `PROXY protocol v1`, авто-закрытием `:80` при DNS-01, `node-mgr ssh-port`, локальным WARP SOCKS5 для Gemini и всех ИИ, BBR + CAKE Shaper и 33-точечной диагностикой)**
 
-[![Version](https://img.shields.io/badge/version-v4.6.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
+[![Version](https://img.shields.io/badge/version-v4.7.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
 [![OS](https://img.shields.io/badge/Ubuntu_22.04%2F24.04_%7C_Debian_11%2F12-151419?style=for-the-badge&logo=debian&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Docker](https://img.shields.io/badge/Docker_Compose_v2_+_Caddy_L4-151419?style=for-the-badge&logo=docker&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Security](https://img.shields.io/badge/UFW_+_Fail2ban_+_nftables-Strict_ACL-2ECC71?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
@@ -13,9 +13,16 @@
 
 ---
 
-## ⚡ Что нового в версии v4.6
+## ⚡ Что нового в версии v4.7
 
-* **🌉 Режим РФ-моста / Каскад (`CFG_NODE_ROLE=relay`) + расширенный ИИ-роутинг в WARP:**
+* **🔐 Нулевые DNS-утечки и ускорение РФ-моста (`AsIs` + DoH `https+local://`):**
+  * На всех нодах вместо открытого UDP-53 (`1.1.1.1`/`8.8.8.8`) используется зашифрованный локальный **DoH** (`https+local://1.1.1.1/dns-query`, `https+local://8.8.8.8/dns-query`).
+  * На **РФ-мостах (`relay`)** включён `"domainStrategy": "AsIs"` (без локального `geoip:ru`): зарубежные домены вообще не резолвятся в РФ и сразу летят по имени в `TO_FOREIGN` (−15..50 мс и ноль DNS-утечек провайдеру).
+* **⚡ `XHTTP + Reality` (`stream-one` + `xmux`) на РФ-мостах:**
+  * Второй инбаунд на Relay-нодах переведён с прямого `XHTTP + TLS` на **`XHTTP + Reality`** (`mode: "stream-one"`, `xmux` с ротацией потоков каждые `600-900` запросов и Selfsteal fallback `xver: 1` на Caddy `:9443`). На Exit Node оставлен `XHTTP + TLS` (`packet-up`) для Cloudflare CDN-резерва.
+* **🔁 Авто-попадание новых серверов в автовыбор (`CFG_HOST_TAG` + `CFG_HOST_HIDDEN`):**
+  * При создании хостов через Remnawave API можно сразу назначить тег (`tags: ["AUTO"]`) и `isHidden`, чтобы каждый новый сервер автоматически попадал в `remnawave.injectHosts` (`tagRegex`) балансера `leastLoad` без ручной правки подписки.
+* **🌉 Режим РФ-моста / Каскад (`CFG_NODE_ROLE=relay`) + расширенный ИИ-роутинг в WARP (v4.6):**
   * В мастере авто-деплоя появился выбор роли сервера: **Exit Node** (зарубежная выходная нода) или **Relay Node** (РФ-мост на зарубежную ноду).
   * На **РФ-мосте (`relay`)**:
     * Первым outbound-ом по умолчанию создаётся зашифрованный канал **`TO_FOREIGN`** (`VLESS + Reality + XTLS-Vision`, с `password` вместо `publicKey` по строгой схеме Remnawave) на зарубежную ноду.

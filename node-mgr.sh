@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.6.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.6.0"
+readonly SCRIPT_VERSION="4.7.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -111,6 +111,8 @@ XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-}"
 XHTTP_PATH="${XHTTP_PATH:-}"
 CFG_XHTTP_CDN="${CFG_XHTTP_CDN:-y}"
 CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
+CFG_HOST_TAG="${CFG_HOST_TAG:-}"
+CFG_HOST_HIDDEN="${CFG_HOST_HIDDEN:-n}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
 VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
 XHTTP_INBOUND_PORT="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
@@ -867,7 +869,7 @@ load_config_file() {
             log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
         fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT CFG_NODE_ROLE RELAY_EXIT_ADDRESS RELAY_EXIT_SNI RELAY_EXIT_PORT RELAY_EXIT_UUID RELAY_EXIT_PBK RELAY_EXIT_SID RELAY_EXIT_FP CFG_RELAY_YOUTUBE_DIRECT CFG_RELAY_RU_DIRECT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_SOCKS_PORT WARP_LICENSE_KEY WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT CFG_HOST_TAG CFG_HOST_HIDDEN CFG_NODE_ROLE RELAY_EXIT_ADDRESS RELAY_EXIT_SNI RELAY_EXIT_PORT RELAY_EXIT_UUID RELAY_EXIT_PBK RELAY_EXIT_SID RELAY_EXIT_FP CFG_RELAY_YOUTUBE_DIRECT CFG_RELAY_RU_DIRECT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_SOCKS_PORT WARP_LICENSE_KEY WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -3478,7 +3480,7 @@ collect_api_inputs() {
                 CFG_RELAY_YOUTUBE_DIRECT="n"
             fi
 
-            if prompt_yn "Пускать российские сайты (.ru/.рф/geoip:ru) напрямую с РФ-моста? (y/n): " "${CFG_RELAY_RU_DIRECT:-y}"; then
+            if prompt_yn "Пускать российские сайты (.ru/.рф) напрямую с РФ-моста (без DNS-утечек)? (y/n): " "${CFG_RELAY_RU_DIRECT:-y}"; then
                 CFG_RELAY_RU_DIRECT="y"
             else
                 CFG_RELAY_RU_DIRECT="n"
@@ -3488,6 +3490,17 @@ collect_api_inputs() {
                 CFG_XHTTP_CDN="y"
             else
                 CFG_XHTTP_CDN="n"
+            fi
+        fi
+
+        local input_htag=""
+        read -p "  ${ORANGE}>${NC} Тег хоста для автовыбора/балансера Remnawave (напр. AUTO или RU, Enter=без тега) [${CFG_HOST_TAG}]: " -r input_htag
+        CFG_HOST_TAG=$(echo "${input_htag:-${CFG_HOST_TAG}}" | tr -d '[:space:]')
+        if [ -n "$CFG_HOST_TAG" ]; then
+            if prompt_yn "Скрыть хост из обычного списка (isHidden=true для injectHosts selectFrom=HIDDEN)? (y/n): " "${CFG_HOST_HIDDEN:-n}"; then
+                CFG_HOST_HIDDEN="y"
+            else
+                CFG_HOST_HIDDEN="n"
             fi
         fi
 
@@ -3661,7 +3674,10 @@ automate_remnawave_api() {
                     loglevel: "warning"
                 },
                 dns: {
-                    servers: ["1.1.1.1", "8.8.8.8"],
+                    servers: [
+                        "https+local://1.1.1.1/dns-query",
+                        "https+local://8.8.8.8/dns-query"
+                    ],
                     queryStrategy: "UseIPv4"
                 },
                 inbounds: [
@@ -3708,7 +3724,32 @@ automate_remnawave_api() {
                             routeOnly: true,
                             destOverride: ["http", "tls", "quic"]
                         },
-                        streamSettings: {
+                        streamSettings: (if $is_relay then {
+                            network: "xhttp",
+                            security: "reality",
+                            xhttpSettings: {
+                                host: $x_dom,
+                                path: $x_path,
+                                mode: "stream-one",
+                                extra: {
+                                    xPaddingBytes: "100-1000",
+                                    xmux: {
+                                        maxConcurrency: "16-32",
+                                        hMaxRequestTimes: "600-900",
+                                        hMaxReusableSecs: "1800-3000"
+                                    }
+                                }
+                            },
+                            realitySettings: {
+                                show: false,
+                                xver: 1,
+                                maxTimeDiff: 300000,
+                                target: $dest,
+                                serverNames: [$x_dom],
+                                privateKey: $pk,
+                                shortIds: [$sid]
+                            }
+                        } else {
                             network: "xhttp",
                             security: "tls",
                             xhttpSettings: {
@@ -3735,7 +3776,7 @@ automate_remnawave_api() {
                                     }
                                 ]
                             }
-                        }
+                        } end)
                     }
                 ],
                 outbounds: (
@@ -3795,7 +3836,7 @@ automate_remnawave_api() {
                     ] else [] end)
                 ),
                 routing: {
-                    domainStrategy: "IPIfNonMatch",
+                    domainStrategy: (if $is_relay then "AsIs" else "IPIfNonMatch" end),
                     rules: (
                         [
                             {
@@ -3843,10 +3884,6 @@ automate_remnawave_api() {
                                     "regexp:\\.рф$",
                                     "regexp:\\.su$"
                                 ],
-                                outboundTag: "DIRECT"
-                            },
-                            {
-                                ip: ["geoip:ru"],
                                 outboundTag: "DIRECT"
                             }
                         ] else [] end) + (if ($use_warp and ($is_relay | not)) then [
@@ -4102,8 +4139,11 @@ automate_remnawave_api() {
     log_success "Нода синхронизирована: UUID=${node_uuid} | NODE_PORT=${CFG_NODE_PORT}"
 
     # ── ШАГ 3: Создание Хостов (/api/hosts) на публичном порту 443 ──────────
-    log_info "Шаг 3/3: Привязка Хостов Reality (${SELF_STEAL_DOMAIN}:443) и XHTTP TLS (${xhttp_dom}:443)..."
+    log_info "Шаг 3/3: Привязка Хостов Reality (${SELF_STEAL_DOMAIN}:443) и XHTTP (${xhttp_dom}:443)..."
     local vision_host_payload xhttp_host_payload host_resp="" host_uuid="" xhost_resp="" xhost_uuid=""
+    local host_tag="${CFG_HOST_TAG:-}"
+    local host_hidden=false
+    [[ "${CFG_HOST_HIDDEN:-n}" =~ ^[Yy]$ ]] && host_hidden=true
 
     if [ -n "$vision_inbound_uuid" ]; then
         local vision_remark="${NODE_NAME} [Reality]"
@@ -4115,6 +4155,8 @@ automate_remnawave_api() {
             --arg addr "$SELF_STEAL_DOMAIN" \
             --arg sni "$SELF_STEAL_DOMAIN" \
             --arg fp "$host_fp" \
+            --arg h_tag "$host_tag" \
+            --argjson h_hidden "$host_hidden" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$vision_inbound_uuid" \
             --arg n_uuid "$node_uuid" \
@@ -4125,18 +4167,20 @@ automate_remnawave_api() {
                 sni: $sni,
                 securityLayer: "DEFAULT",
                 fingerprint: $fp,
+                isHidden: $h_hidden,
                 nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
                     configProfileInboundUuid: $i_uuid
                 }
-            }')
+            } + (if $h_tag != "" then {tags: [$h_tag]} else {} end)')
 
         if host_resp=$(remnawave_api_request "POST" "/api/hosts" "$vision_host_payload" 2>/dev/null) \
-           || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$vision_host_payload" | jq 'del(.nodes)')" 2>/dev/null); then
+           || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$vision_host_payload" | jq --arg t "$host_tag" 'del(.tags) + (if $t != "" then {tag: $t} else {} end)')" 2>/dev/null) \
+           || host_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$vision_host_payload" | jq 'del(.nodes, .tags, .isHidden)')" 2>/dev/null); then
             host_uuid=$(echo "$host_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_HOST_UUID="$host_uuid"
-            log_success "Хост Reality создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443, fp=${host_fp})"
+            log_success "Хост ${vision_remark} создан: UUID=${host_uuid} (${SELF_STEAL_DOMAIN}:443, fp=${host_fp}${host_tag:+, tag=${host_tag}})"
         else
             log_warning "Хост Reality (${SELF_STEAL_DOMAIN}) уже существует или требует проверки в панели."
         fi
@@ -4144,7 +4188,9 @@ automate_remnawave_api() {
 
     if [ -n "$xhttp_inbound_uuid" ]; then
         local xhttp_remark="${NODE_NAME} [XHTTP]"
-        if [ "$xhttp_cdn" = true ]; then
+        if [ "$is_relay" = true ]; then
+            xhttp_remark="${NODE_NAME} [RU-XHTTP]"
+        elif [ "$xhttp_cdn" = true ]; then
             xhttp_remark="${NODE_NAME} [XHTTP CDN]"
         fi
         xhttp_host_payload=$(jq -n \
@@ -4154,31 +4200,36 @@ automate_remnawave_api() {
             --arg host_hdr "$xhttp_dom" \
             --arg path "$xhttp_path" \
             --arg fp "$host_fp" \
+            --arg h_tag "$host_tag" \
+            --argjson h_hidden "$host_hidden" \
+            --argjson is_relay "$is_relay" \
             --arg p_uuid "$profile_uuid" \
             --arg i_uuid "$xhttp_inbound_uuid" \
             --arg n_uuid "$node_uuid" \
-            '{
+            '({
                 remark: $remark,
                 address: $addr,
                 port: 443,
                 sni: $sni,
                 host: $host_hdr,
                 path: $path,
-                alpn: "h2,http/1.1",
-                securityLayer: "TLS",
+                securityLayer: (if $is_relay then "DEFAULT" else "TLS" end),
                 fingerprint: $fp,
+                isHidden: $h_hidden,
                 nodes: (if $n_uuid != "" then [$n_uuid] else [] end),
                 inbound: {
                     configProfileUuid: $p_uuid,
                     configProfileInboundUuid: $i_uuid
                 }
-            }')
+            } + (if ($is_relay | not) then {alpn: "h2,http/1.1"} else {} end)
+              + (if $h_tag != "" then {tags: [$h_tag]} else {} end))')
 
         if xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$xhttp_host_payload" 2>/dev/null) \
-           || xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq 'del(.nodes, .alpn)')" 2>/dev/null); then
+           || xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq --arg t "$host_tag" 'del(.tags) + (if $t != "" then {tag: $t} else {} end)')" 2>/dev/null) \
+           || xhost_resp=$(remnawave_api_request "POST" "/api/hosts" "$(echo "$xhttp_host_payload" | jq 'del(.nodes, .alpn, .tags, .isHidden)')" 2>/dev/null); then
             xhost_uuid=$(echo "$xhost_resp" | jq -r '.response.uuid // .data.uuid // .uuid // empty')
             DETAIL_XHTTP_HOST_UUID="$xhost_uuid"
-            log_success "Хост ${xhttp_remark} создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path}, fp=${host_fp})"
+            log_success "Хост ${xhttp_remark} создан: UUID=${xhost_uuid} (${xhttp_dom}:443, path=${xhttp_path}, fp=${host_fp}${host_tag:+, tag=${host_tag}})"
         else
             log_warning "Хост XHTTP (${xhttp_dom}) уже существует или требует проверки в панели."
         fi
@@ -4198,6 +4249,8 @@ XHTTP_HOST_UUID="${DETAIL_XHTTP_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
 XHTTP_STEAL_DOMAIN="${xhttp_dom}"
 XHTTP_PATH="${xhttp_path}"
+CFG_HOST_TAG="${host_tag}"
+CFG_HOST_HIDDEN="$([ "$host_hidden" = true ] && echo "y" || echo "n")"
 CFG_NODE_ROLE="$([ "$is_relay" = true ] && echo "relay" || echo "exit")"
 RELAY_EXIT_ADDRESS="${r_addr}"
 RELAY_EXIT_SNI="${r_sni}"
@@ -4966,7 +5019,15 @@ run_verify_stack() {
         local x_code=""
         x_code=$(curl -sS -o /dev/null -w "%{http_code}" --http2 --tlsv1.2 --connect-timeout 5 --max-time 8 \
             --resolve "${x_dom}:443:127.0.0.1" "https://${x_dom}/" 2>/dev/null || echo "000")
-        if [ "$x_code" != "000" ]; then
+        if [ "$(get_saved_node_role)" = "relay" ]; then
+            if [ "$x_code" = "200" ]; then
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} L4 -> XHTTP Reality Fallback E2E (${x_dom}:443 -> :${x_port} -> :${c_port}): HTTP 200"
+            elif [ "$x_code" != "000" ]; then
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} L4 -> XHTTP E2E (${x_dom}:443 -> :${x_port}): HTTP ${x_code}"
+            else
+                box_row "${YELLOW}${BOLD}[ WARN ]${NC} L4 -> XHTTP Reality E2E (${x_dom}:443): рукопожатие не прошло (код 000)"
+            fi
+        elif [ "$x_code" != "000" ]; then
             box_row "${GREEN}${BOLD}[ PASS ]${NC} L4 -> XHTTP TLS E2E (${x_dom}:443 -> :${x_port}, доверенный SSL): HTTP ${x_code}"
         else
             box_row "${YELLOW}${BOLD}[ WARN ]${NC} L4 -> XHTTP TLS E2E (${x_dom}:443): рукопожатие TLS не прошло (код 000)"
@@ -5665,6 +5726,8 @@ XHTTP_STEAL_DOMAIN="$(get_saved_xhttp_domain)"
 XHTTP_PATH="$(get_saved_xhttp_path)"
 CFG_XHTTP_CDN="$(get_saved_xhttp_cdn)"
 CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
+CFG_HOST_TAG="${CFG_HOST_TAG}"
+CFG_HOST_HIDDEN="${CFG_HOST_HIDDEN:-n}"
 CFG_NODE_ROLE="$(get_saved_node_role)"
 RELAY_EXIT_ADDRESS="${RELAY_EXIT_ADDRESS}"
 RELAY_EXIT_SNI="${RELAY_EXIT_SNI}"
@@ -5778,6 +5841,8 @@ show_help() {
     XHTTP_PATH="/api/v2/telemetry/a1b2c3d4" # по умолчанию генерируется уникальный путь
     CFG_XHTTP_CDN="y"                       # y = Cloudflare CDN резерв (оранжевое облако, mode: packet-up)
     CFG_FINGERPRINT="randomized"            # randomized | chrome | firefox | ios
+    CFG_HOST_TAG="AUTO"                     # тег хоста для автовыбора/балансера Remnawave (injectHosts)
+    CFG_HOST_HIDDEN="n"                     # y = скрыть хост из обычного списка (для selectFrom=HIDDEN)
     SELF_STEAL_PORT="9443"
     CFG_ENABLE_WARP="y"          # y = локальный WARP SOCKS5 (127.0.0.1:40000) для Gemini + всех ИИ
     CFG_NODE_ROLE="exit"         # exit = зарубежная нода | relay = РФ-мост (-> RELAY_EXIT_*)
