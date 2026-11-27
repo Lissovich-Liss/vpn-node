@@ -2,9 +2,9 @@
 
 # 🦊 LissVPN Node Orchestrator (`node-mgr`)
 
-**Production-ready оркестратор v4.4, автоматизатор Remnawave API (Caddy L4: VLESS Reality Vision + VLESS XHTTP TLS Cloudflare CDN-резерв с `/certs:ro`), локальный Cloudflare WARP SOCKS5 (`caomingjun/warp` -> `127.0.0.1:40000` для Gemini + OpenAI/ChatGPT), Anti-Detect DPI/uTLS твики, E2E-тестер рукопожатий, Highload-оптимизатор ядра (BBR + CAKE Shaper), генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
+**Production-ready оркестратор v4.5, автоматизатор Remnawave API (Caddy L4 с `PROXY protocol v1` + VLESS Reality Vision `xver: 1` + VLESS XHTTP TLS Cloudflare CDN-резерв с `/certs:ro`), авто-закрытие `:80` при DNS-01, безопасная смена SSH-порта (`ssh-port`), локальный Cloudflare WARP SOCKS5 (`caomingjun/warp` -> `127.0.0.1:40000`), Anti-Detect DPI/uTLS твики, E2E-тестер, Highload BBR + CAKE Shaper, генератор защиты (`nftables`) и 33-точечный диагностический тулкит**
 
-[![Version](https://img.shields.io/badge/version-v4.4.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
+[![Version](https://img.shields.io/badge/version-v4.5.0-F56E0F?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
 [![OS](https://img.shields.io/badge/Ubuntu_22.04%2F24.04_%7C_Debian_11%2F12-151419?style=for-the-badge&logo=debian&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Docker](https://img.shields.io/badge/Docker_Compose_v2_+_Caddy_L4-151419?style=for-the-badge&logo=docker&logoColor=F56E0F)](https://github.com/Lissovich-Liss/vpn-node)
 [![Security](https://img.shields.io/badge/UFW_+_Fail2ban_+_nftables-Strict_ACL-2ECC71?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Lissovich-Liss/vpn-node)
@@ -13,8 +13,14 @@
 
 ---
 
-## ⚡ Что нового в версии v4.3
+## ⚡ Что нового в версии v4.5
 
+* **🔒 Сквозной `PROXY protocol v1` (`Caddy L4 -> Xray Vision -> Caddy Selfsteal`):**
+  * Caddy L4 отправляет `proxy_protocol v1` на Xray Vision (`127.0.0.1:10443`) и catch-all (`127.0.0.1:9443`), Xray Vision принимает реальные IP клиентов (`rawSettings.acceptProxyProtocol: true`) и прокидывает их дальше в Caddy Selfsteal (`realitySettings.xver: 1`), а Caddy `:9443` парсит `listener_wrappers { proxy_protocol { allow 127.0.0.1/32 }; tls }` (строго со скоупом на loopback-порт, не затрагивая `:80`).
+  * В результате и Xray, и логи Caddy (`access.log` → Fail2ban `caddy-status`) видят **реальные IP сканеров и клиентов** вместо `127.0.0.1`, а `node-mgr verify` автоматически использует `curl --haproxy-protocol` для прямой проверки `:9443`.
+* **🛡️ Закрытие лишних портов (`80/tcp` + `node-mgr ssh-port`):**
+  * При выборе **Cloudflare DNS-01 (`CFG_CERT_TYPE=2`)** блоки `:80` не создаются в `Caddyfile`, порт `80/tcp` автоматически закрывается в UFW и не открывается в `firewall.nft` — снаружи на IP ноды остаётся только `443` + твой SSH-порт.
+  * Новая команда **`node-mgr ssh-port [PORT]`** (и пункт в меню `[9]`) безопасно переносит SSH на нестандартный порт с поддержкой `ssh.socket` (Ubuntu 22.10/24.04), проверкой `sshd -t`, автоматическим откатом при сбое, синхронизацией Fail2ban и закрытием старого `22/tcp` в UFW **только после подтверждения входа во втором окне**.
 * **☁️ VLESS XHTTP TLS как Cloudflare CDN-резерв (оранжевое облако, `CFG_XHTTP_CDN=y`):**
   * **Vision (`SELF_STEAL_DOMAIN`)** остаётся на прямом IP (серое облако DNS-only) для максимальной скорости и минимального пинга.
   * **XHTTP (`XHTTP_STEAL_DOMAIN`)** настраивается для работы за **Cloudflare CDN (Proxied / оранжевое облако)**: `mode: "packet-up"`, `scMaxEachPostBytes: 1000000`, `scMinPostsIntervalMs: 30`, `xPaddingBytes: "100-1000"`, SSL/TLS `Full (strict)` с реальным сертификатом `/certs:ro` и хостом `[XHTTP CDN]` в панели Remnawave.

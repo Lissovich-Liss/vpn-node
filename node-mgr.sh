@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.4.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.5.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.4.0"
+readonly SCRIPT_VERSION="4.5.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -508,6 +508,17 @@ get_saved_xhttp_cdn() {
         xcdn=$(grep -E '^XHTTP_CDN=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
     fi
     echo "${xcdn:-${CFG_XHTTP_CDN:-y}}"
+}
+
+get_saved_cert_type() {
+    local ct=""
+    if [ -f "$CADDY_DIR/.env" ]; then
+        ct=$(grep -E '^CERT_TYPE=' "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    if [ -z "$ct" ] && [ -f "$CADDY_DIR/Caddyfile" ] && grep -q 'dns cloudflare' "$CADDY_DIR/Caddyfile" 2>/dev/null; then
+        ct="2"
+    fi
+    echo "${ct:-${CFG_CERT_TYPE:-1}}"
 }
 
 get_caddy_cert_paths() {
@@ -2630,6 +2641,7 @@ XHTTP_CDN=${CFG_XHTTP_CDN:-y}
 SELF_STEAL_PORT=${SELF_STEAL_PORT}
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
+CERT_TYPE=${cert_choice}
 ${cf_token:+CLOUDFLARE_API_TOKEN=${cf_token}}
 EOF
     chmod 600 "$CADDY_DIR/.env"
@@ -2666,11 +2678,36 @@ EOF
         }"
     fi
 
-    # 4. Генерация /opt/selfsteel/Caddyfile (L4 SNI-роутинг на :443 + Selfsteal HTTPS на 127.0.0.1:9443)
-    # ВАЖНО: не задаём default_bind 127.0.0.1 глобально, чтобы :80 слушал IPv4+IPv6 (0.0.0.0 и ::) для ACME HTTP-01
+    # 4. Генерация /opt/selfsteel/Caddyfile (L4 SNI-роутинг на :443 с PROXY protocol v1 + Selfsteal HTTPS на 127.0.0.1:9443)
+    # ВАЖНО: servers 127.0.0.1:{$SELF_STEAL_PORT} строго скоупирован на loopback-порт заглушки, чтобы :80 (HTTP-01) не требовал PROXY-заголовок.
+    # При Cloudflare DNS-01 (cert_choice=2) блоки :80 не создаются вообще — порт 80 остаётся закрытым.
+    local http_blocks_cfg=""
+    if [ "$cert_choice" != "2" ]; then
+        http_blocks_cfg='
+http://{$SELF_STEAL_DOMAIN}, http://{$XHTTP_STEAL_DOMAIN} {
+    redir https://{host}{uri} permanent
+}
+
+:80 {
+    @not_acme not path /.well-known/acme-challenge/*
+    header -Server
+    respond @not_acme 204
+}'
+    fi
+
     cat > "$CADDY_DIR/Caddyfile" << EOF
 {
     https_port {\$SELF_STEAL_PORT}
+    servers 127.0.0.1:{\$SELF_STEAL_PORT} {
+        listener_wrappers {
+            proxy_protocol {
+                allow 127.0.0.1/32
+                timeout 5s
+            }
+            tls
+        }
+        protocols h1 h2
+    }
     auto_https disable_redirects
     admin off
 
@@ -2678,7 +2715,10 @@ EOF
         0.0.0.0:443 {
             @vision tls sni {\$SELF_STEAL_DOMAIN}
             route @vision {
-                proxy 127.0.0.1:{\$VISION_INBOUND_PORT}
+                proxy {
+                    proxy_protocol v1
+                    upstream 127.0.0.1:{\$VISION_INBOUND_PORT}
+                }
             }
 
             @xhttp tls sni {\$XHTTP_STEAL_DOMAIN}
@@ -2687,15 +2727,15 @@ EOF
             }
 
             route {
-                proxy 127.0.0.1:{\$SELF_STEAL_PORT}
+                proxy {
+                    proxy_protocol v1
+                    upstream 127.0.0.1:{\$SELF_STEAL_PORT}
+                }
             }
         }
     }
 }
-
-http://{\$SELF_STEAL_DOMAIN}, http://{\$XHTTP_STEAL_DOMAIN} {
-    redir https://{host}{uri} permanent
-}
+${http_blocks_cfg}
 
 https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
     bind 127.0.0.1
@@ -2727,12 +2767,6 @@ https://{\$SELF_STEAL_DOMAIN}, https://{\$XHTTP_STEAL_DOMAIN} {
     tls internal
     header -Server
     respond 204
-}
-
-:80 {
-    @not_acme not path /.well-known/acme-challenge/*
-    header -Server
-    respond @not_acme 204
 }
 EOF
 
@@ -2766,12 +2800,22 @@ EOF
     # 6. Pre-flight портов 80/443, сборка образа, валидация Caddyfile и запуск
     docker rm -f caddy-selfsteal "$CADDY_CONTAINER_NAME" 2>/dev/null || true
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
-        ufw allow 80/tcp comment 'Caddy ACME HTTP-01' >/dev/null 2>&1 || true
+        if [ "$cert_choice" = "2" ]; then
+            ufw delete allow 80/tcp >/dev/null 2>&1 || true
+            ufw delete allow 80 >/dev/null 2>&1 || true
+            log_info "Cloudflare DNS-01 активен: порт 80/tcp закрыт в UFW"
+        else
+            ufw allow 80/tcp comment 'Caddy ACME HTTP-01' >/dev/null 2>&1 || true
+        fi
         ufw allow 443/tcp comment 'Xray Reality TCP' >/dev/null 2>&1 || true
         ufw allow 443/udp comment 'Xray Reality QUIC' >/dev/null 2>&1 || true
     fi
     local port_conflict
-    port_conflict=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)\s' || true)
+    if [ "$cert_choice" = "2" ]; then
+        port_conflict=$(ss -tlnp 2>/dev/null | grep -E ':443\s' || true)
+    else
+        port_conflict=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)\s' || true)
+    fi
     if [ -n "$port_conflict" ]; then
         log_warning "Обнаружены процессы на портах 80/443 перед запуском Caddy:"
         echo "$port_conflict" | sed 's/^/    /'
@@ -3519,11 +3563,11 @@ automate_remnawave_api() {
                             network: "raw",
                             security: "reality",
                             rawSettings: {
-                                acceptProxyProtocol: false
+                                acceptProxyProtocol: true
                             },
                             realitySettings: {
                                 show: false,
-                                xver: 0,
+                                xver: 1,
                                 maxTimeDiff: 300000,
                                 target: $dest,
                                 serverNames: [$v_dom],
@@ -4038,9 +4082,6 @@ setup_ufw() {
     ufw allow in on lo >/dev/null 2>&1 || true
 
     ufw allow "${ssh_port}/tcp" comment 'SSH Active' >/dev/null 2>&1 || true
-    if [ "$ssh_port" != "22" ]; then
-        ufw allow 22/tcp comment 'SSH Default' >/dev/null 2>&1 || true
-    fi
 
     ufw delete allow "${node_port}/tcp" >/dev/null 2>&1 || true
     ufw delete allow "${node_port}" >/dev/null 2>&1 || true
@@ -4058,7 +4099,15 @@ setup_ufw() {
 
     ufw allow 443/tcp comment 'Xray Reality TCP' >/dev/null 2>&1
     ufw allow 443/udp comment 'Xray Reality QUIC' >/dev/null 2>&1
-    ufw allow 80/tcp comment 'Caddy ACME HTTP-01' >/dev/null 2>&1
+    local saved_ct
+    saved_ct=$(get_saved_cert_type)
+    if [ "$saved_ct" = "2" ]; then
+        ufw delete allow 80/tcp >/dev/null 2>&1 || true
+        ufw delete allow 80 >/dev/null 2>&1 || true
+        log_info "Cloudflare DNS-01: порт 80/tcp закрыт в UFW (снаружи открыт только 443 и SSH ${ssh_port})"
+    else
+        ufw allow 80/tcp comment 'Caddy ACME HTTP-01' >/dev/null 2>&1
+    fi
 
     if [ -n "$caddy_port" ] && [ "$caddy_port" != "443" ]; then
         ufw delete allow "${caddy_port}/tcp" >/dev/null 2>&1 || true
@@ -4066,9 +4115,148 @@ setup_ufw() {
     fi
 
     ufw --force enable >/dev/null 2>&1
-    _log_fix "UFW enabled (port ${node_port} restricted to panel ${panel_ip})"
-    log_success "UFW активен: порт ${node_port}/tcp открыт ТОЛЬКО для панели ${panel_ip}"
+    _log_fix "UFW enabled (port ${node_port} restricted to panel ${panel_ip}, ssh=${ssh_port}, cert_type=${saved_ct})"
+    log_success "UFW активен: порт ${node_port}/tcp открыт ТОЛЬКО для панели ${panel_ip}, SSH: ${ssh_port}/tcp$([ "$saved_ct" = "2" ] && echo ", порт 80 закрыт")"
     STATUS_UFW="настроен"
+}
+
+change_ssh_port() {
+    _init_env
+    print_header "БЕЗОПАСНАЯ СМЕНА SSH-ПОРТА (ANTI-SCAN + UBUNTU 24.04 SSH.SOCKET)"
+
+    local cur_port new_port="${1:-}"
+    cur_port=$(detect_ssh_port)
+    local node_port caddy_port
+    node_port=$(get_saved_node_port)
+    caddy_port=$(get_saved_caddy_port)
+
+    log_info "Текущий активный SSH-порт: ${ORANGE}${cur_port}/tcp${NC}"
+    if [ -z "$new_port" ]; then
+        if [ "${NON_INTERACTIVE:-false}" = true ]; then
+            log_error "Укажите новый SSH-порт: node-mgr ssh-port <PORT>"
+            return 1
+        fi
+        local suggested_port=$(( 49200 + (RANDOM % 14000) ))
+        while [ -z "$new_port" ]; do
+            read -p "  ${ORANGE}>${NC} Новый SSH-порт [1025-65535, Enter=${suggested_port}]: " -r new_port
+            new_port="${new_port:-$suggested_port}"
+            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1025 ] || [ "$new_port" -gt 65535 ]; then
+                log_warning "Укажите число от 1025 до 65535."
+                new_port=""
+            elif [ "$new_port" = "$cur_port" ]; then
+                log_info "SSH уже работает на порту ${cur_port}."
+                return 0
+            elif [[ " 80 443 ${caddy_port} ${VISION_INBOUND_PORT} ${XHTTP_INBOUND_PORT} ${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT} ${node_port} " == *" ${new_port} "* ]]; then
+                log_warning "Порт ${new_port} зарезервирован под VPN/Caddy/RemnaNode!"
+                new_port=""
+            elif ss -tlnp 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
+                log_warning "Порт ${new_port} уже занят другим процессом!"
+                new_port=""
+            fi
+        done
+    else
+        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1025 ] || [ "$new_port" -gt 65535 ]; then
+            log_error "Некорректный порт '${new_port}' (требуется 1025..65535)."
+            return 1
+        fi
+        if [ "$new_port" = "$cur_port" ]; then
+            log_info "SSH уже работает на порту ${cur_port}."
+            return 0
+        fi
+        if [[ " 80 443 ${caddy_port} ${VISION_INBOUND_PORT} ${XHTTP_INBOUND_PORT} ${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT} ${node_port} " == *" ${new_port} "* ]]; then
+            log_error "Порт ${new_port} конфликтует с портами VPN/Caddy/RemnaNode!"
+            return 1
+        fi
+    fi
+
+    # 1. Сначала открываем НОВЫЙ порт в UFW (старый порт пока НЕ трогаем!)
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "${new_port}/tcp" comment 'SSH Active' >/dev/null 2>&1 || true
+        log_success "Новый порт ${new_port}/tcp заранее открыт в UFW (старый ${cur_port}/tcp пока оставлен)"
+    fi
+
+    # 2. Записываем drop-in для sshd (+ поддержка ssh.socket в Ubuntu 22.10/24.04)
+    mkdir -p /etc/ssh/sshd_config.d
+    local ssh_dropin="/etc/ssh/sshd_config.d/99-lissvpn-port.conf"
+    local sock_dropin="/etc/systemd/system/ssh.socket.d/99-lissvpn-port.conf"
+    local had_socket=false
+
+    cat > "$ssh_dropin" << EOF
+# Managed by node-mgr v${SCRIPT_VERSION}
+Port ${new_port}
+EOF
+    chmod 644 "$ssh_dropin"
+
+    # Если старый /etc/ssh/sshd_config не подключает sshd_config.d — добавляем Include
+    if [ -f /etc/ssh/sshd_config ] && ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+        cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%s)"
+        sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+    fi
+
+    if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+        had_socket=true
+        mkdir -p /etc/systemd/system/ssh.socket.d
+        cat > "$sock_dropin" << EOF
+[Socket]
+ListenStream=
+ListenStream=${new_port}
+EOF
+    fi
+
+    # 3. Обязательная проверка конфигурации sshd -t до рестарта
+    if ! sshd -t 2>/dev/null; then
+        log_error "Проверка 'sshd -t' провалилась! Откатываем изменения SSH..."
+        rm -f "$ssh_dropin" "$sock_dropin"
+        systemctl daemon-reload 2>/dev/null || true
+        return 1
+    fi
+
+    # 4. Применяем порт и проверяем, что sshd реально слушает новый порт
+    systemctl daemon-reload 2>/dev/null || true
+    if [ "$had_socket" = true ]; then
+        systemctl restart ssh.socket 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    else
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    fi
+    sleep 1
+
+    if ! ss -tlnp 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
+        log_error "SSH не поднялся на порту ${new_port}! Откатываем изменения..."
+        rm -f "$ssh_dropin" "$sock_dropin"
+        systemctl daemon-reload 2>/dev/null || true
+        if [ "$had_socket" = true ]; then
+            systemctl restart ssh.socket 2>/dev/null || true
+        else
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    # 5. Синхронизация Fail2ban [sshd] с новым портом
+    if [ -f /etc/fail2ban/jail.local ]; then
+        sed -i -E "s|^port[[:space:]]*=[[:space:]]*${cur_port}\b|port = ${new_port}|g" /etc/fail2ban/jail.local 2>/dev/null || true
+        systemctl restart fail2ban 2>/dev/null || true
+    fi
+
+    log_success "SSH успешно слушает на новом порту ${new_port}/tcp!"
+    echo
+    box_top "ПРОВЕРЬТЕ ВХОД ДО ЗАКРЫТИЯ СТАРОГО ПОРТА ${cur_port}/tcp"
+    box_row "${YELLOW}${BOLD}[!] НЕ закрывайте текущую сессию!${NC}"
+    box_row "Откройте НОВОЕ окно терминала и проверьте подключение:"
+    box_row "${CYAN}ssh -p ${new_port} root@${NODE_IP}${NC}"
+    box_bottom
+    echo
+
+    if [ "${NON_INTERACTIVE:-false}" != true ] && command -v ufw >/dev/null 2>&1; then
+        if prompt_yn "Вход по порту ${new_port} проверен во втором окне? Закрыть старый порт ${cur_port}/tcp в UFW? (y/n): " "n"; then
+            ufw delete allow "${cur_port}/tcp" >/dev/null 2>&1 || true
+            ufw delete allow "${cur_port}" >/dev/null 2>&1 || true
+            log_success "Старый SSH-порт ${cur_port}/tcp закрыт в UFW (активен только ${new_port}/tcp)"
+        else
+            log_info "Старый порт ${cur_port}/tcp оставлен в UFW. Когда проверите вход, закройте его командой: ufw delete allow ${cur_port}/tcp"
+        fi
+    fi
+    _log_fix "SSH port changed ${cur_port} -> ${new_port}"
 }
 
 install_fail2ban() {
@@ -4550,11 +4738,14 @@ run_verify_stack() {
 
     box_top "2/3 · СКВОЗНОЙ ТЕСТ РУКОПОЖАТИЙ И МАСКИРОВКИ (E2E PROBE)"
     if [ -n "$v_dom" ]; then
-        local c_probe=""
-        c_probe=$(curl -sS -I --http2 --tlsv1.3 --connect-timeout 5 --max-time 8 \
+        local c_probe="" c_pp_flag=""
+        if [ -f "$CADDY_DIR/Caddyfile" ] && grep -q 'proxy_protocol' "$CADDY_DIR/Caddyfile" 2>/dev/null; then
+            c_pp_flag="--haproxy-protocol"
+        fi
+        c_probe=$(curl -sS -I ${c_pp_flag} --http2 --tlsv1.3 --connect-timeout 5 --max-time 8 \
             --resolve "${v_dom}:${c_port}:127.0.0.1" "https://${v_dom}:${c_port}/" 2>/dev/null | head -1 | tr -d '\r' || true)
         if echo "$c_probe" | grep -qE "HTTP/(2|1\.1) 200"; then
-            box_row "${GREEN}${BOLD}[ PASS ]${NC} Caddy Selfsteal (127.0.0.1:${c_port}, SNI ${v_dom}): ${c_probe}"
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} Caddy Selfsteal (127.0.0.1:${c_port}${c_pp_flag:+, PROXY v1}, SNI ${v_dom}): ${c_probe}"
         else
             box_row "${YELLOW}${BOLD}[ WARN ]${NC} Caddy Selfsteal (127.0.0.1:${c_port}): ${c_probe:-нет ответа HTTP 200}"
         fi
@@ -4682,6 +4873,12 @@ run_protect() {
         ip saddr ${panel_ip} tcp dport ${node_port} accept"
     fi
 
+    local http80_rule="# HTTP ACME port 80
+        tcp dport 80 accept"
+    if [ "$(get_saved_cert_type)" = "2" ]; then
+        http80_rule="# Cloudflare DNS-01 активен — порт 80/tcp закрыт"
+    fi
+
     cat > "${PROTECT_OUT_DIR}/firewall.nft" << EOF
 #!/usr/sbin/nft -f
 # Generated by node-mgr v${SCRIPT_VERSION} (protect module)
@@ -4741,8 +4938,7 @@ table inet vpn_protect {
         ${panel_rule}
         tcp dport ${node_port} drop
 
-        # HTTP ACME port 80
-        tcp dport 80 accept
+        ${http80_rule}
 
         # VLESS Reality port 443/tcp per-IP new connection limit (anti-SYN flood)
         tcp dport 443 ct state new add @syn_443_meter4 { ip saddr limit rate 60/second burst 120 packets } accept
@@ -5316,6 +5512,7 @@ show_help() {
                                  Тюнинг ядра, BBR + sch_cake/fq, FD, RPS/XPS, NIC (LRO off), TCPMSS, Zram, Shaper
     shape [MBIT]                 Включить CAKE Traffic Shaper (dual-srchost) для защиты от перегрузки канала
     warp                         Запуск контейнера Cloudflare WARP SOCKS5 (127.0.0.1:40000 для Gemini + OpenAI)
+    ssh-port [PORT]              Безопасная смена SSH-порта (UFW + Ubuntu ssh.socket + sshd -t + Fail2ban)
     protect                      Генерация защитных конфигов nftables (anti-DDoS) и sshd hardening
     bbr3                         Установка ядра XanMod с поддержкой BBRv3 (с проверкой релиза и GPG)
     rollback                     Откат всех наложенных оптимизаций
@@ -5372,7 +5569,7 @@ show_main_menu() {
         echo
         echo -e "  ${SLATE}${BOLD}БЕЗОПАСНОСТЬ И ОБСЛУЖИВАНИЕ${NC}"
         echo -e "    ${ORANGE}${BOLD}[8]${NC} ${WHITE}Статус и Логи${NC}        ${DIM}дашборд служб, NetBird, Мониторинг, просмотр логов${NC}"
-        echo -e "    ${ORANGE}${BOLD}[9]${NC} ${WHITE}Защита (Protect)${NC}     ${DIM}генератор таблиц nftables anti-DDoS + SSH Hardening${NC}"
+        echo -e "    ${ORANGE}${BOLD}[9]${NC} ${WHITE}Защита и SSH-порт${NC}    ${DIM}генератор nftables anti-DDoS + безопасная смена SSH-порта${NC}"
         echo -e "   ${ORANGE}${BOLD}[10]${NC} ${WHITE}Обновить компоненты${NC}  ${DIM}docker pull (Node/Caddy/Monitoring) + self-update${NC}"
         echo -e "   ${ORANGE}${BOLD}[11]${NC} ${WHITE}Откат / Удаление${NC}     ${DIM}снять оптимизации (rollback), экспорт или удалить узел${NC}"
         echo -e "    ${ORANGE}${BOLD}[0]${NC} ${GRAPHITE}Выход${NC}"
@@ -5417,7 +5614,14 @@ show_main_menu() {
                     3) show_logs "f2b" ;;
                 esac
                 ;;
-            9) run_protect ;;
+            9)
+                echo -e "    ${ORANGE}[1]${NC} Сгенерировать nftables anti-DDoS + SSH Hardening (protect)"
+                echo -e "    ${ORANGE}[2]${NC} Безопасно сменить SSH-порт (UFW + ssh.socket + Fail2ban)"
+                printf "  ${ORANGE}>${NC} Выбор [Enter=1]: "
+                local pc=""
+                read -r pc
+                if [ "$pc" = "2" ]; then change_ssh_port; else run_protect; fi
+                ;;
             10)
                 echo -e "    ${ORANGE}[1]${NC} Обновить контейнеры (RemnaNode, Caddy Selfsteal, Мониторинг)"
                 echo -e "    ${ORANGE}[2]${NC} Обновить сам скрипт node-mgr с GitHub (self-update)"
@@ -5490,6 +5694,7 @@ case "$cmd" in
     optimize|opt|tune|--optimize)      run_optimize "${1:---all}" "${2:-}" ;;
     shape|shaper|--shaper)             _init_env; opt_shaper "${1:-}" ;;
     warp|--warp)                       configure_warp_routing ;;
+    ssh-port|ssh|--ssh-port)           change_ssh_port "${1:-}" ;;
     protect|hardening|--protect)       run_protect ;;
     bbr3|kernel|--bbr3)                run_bbr3_xanmod ;;
     rollback|revert|--rollback)        run_rollback ;;
