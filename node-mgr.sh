@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.5.0 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.6.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.5.0"
+readonly SCRIPT_VERSION="4.6.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -115,7 +115,19 @@ SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
 VISION_INBOUND_PORT="${VISION_INBOUND_PORT:-$DEFAULT_VISION_PORT}"
 XHTTP_INBOUND_PORT="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
 
-# Cloudflare WARP SOCKS5 Proxy (caomingjun/warp -> 127.0.0.1:40000 для Gemini + OpenAI/ChatGPT)
+# Роль сервера: exit (зарубежная выходная нода + WARP для ИИ) | relay (РФ-мост на зарубежную ноду + YouTube/.ru DIRECT)
+CFG_NODE_ROLE="${CFG_NODE_ROLE:-exit}"
+RELAY_EXIT_ADDRESS="${RELAY_EXIT_ADDRESS:-}"
+RELAY_EXIT_SNI="${RELAY_EXIT_SNI:-}"
+RELAY_EXIT_PORT="${RELAY_EXIT_PORT:-443}"
+RELAY_EXIT_UUID="${RELAY_EXIT_UUID:-}"
+RELAY_EXIT_PBK="${RELAY_EXIT_PBK:-}"
+RELAY_EXIT_SID="${RELAY_EXIT_SID:-}"
+RELAY_EXIT_FP="${RELAY_EXIT_FP:-chrome}"
+CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-y}"
+CFG_RELAY_RU_DIRECT="${CFG_RELAY_RU_DIRECT:-y}"
+
+# Cloudflare WARP SOCKS5 Proxy (caomingjun/warp -> 127.0.0.1:40000 для Gemini + всех ИИ)
 CFG_ENABLE_WARP="${CFG_ENABLE_WARP:-y}"
 WARP_SOCKS_PORT="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
 WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
@@ -521,6 +533,14 @@ get_saved_cert_type() {
     echo "${ct:-${CFG_CERT_TYPE:-1}}"
 }
 
+get_saved_node_role() {
+    local nr=""
+    if [ -f "$API_STATE_FILE" ]; then
+        nr=$(grep -E '^CFG_NODE_ROLE=' "$API_STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+    fi
+    echo "${nr:-${CFG_NODE_ROLE:-exit}}"
+}
+
 get_caddy_cert_paths() {
     local clean_dom="${1#\*.}"
     local default_crt="/certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${clean_dom}/${clean_dom}.crt"
@@ -847,7 +867,7 @@ load_config_file() {
             log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
         fi
         log_info "Загрузка конфигурации из $config_file"
-        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_SOCKS_PORT WARP_LICENSE_KEY WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
+        local _allowed_vars="REMNAWAVE_API_URL REMNAWAVE_API_TOKEN NODE_NAME NODE_ADDRESS SELF_STEAL_DOMAIN XHTTP_STEAL_DOMAIN XHTTP_PATH CFG_XHTTP_CDN CFG_FINGERPRINT CFG_NODE_ROLE RELAY_EXIT_ADDRESS RELAY_EXIT_SNI RELAY_EXIT_PORT RELAY_EXIT_UUID RELAY_EXIT_PBK RELAY_EXIT_SID RELAY_EXIT_FP CFG_RELAY_YOUTUBE_DIRECT CFG_RELAY_RU_DIRECT SELF_STEAL_PORT VISION_INBOUND_PORT XHTTP_INBOUND_PORT CFG_ENABLE_WARP WARP_SOCKS_PORT WARP_LICENSE_KEY WARP_PRIVATE_KEY WARP_IPV6 WARP_RESERVED WARP_ENDPOINT WARP_PUBLIC_KEY CFG_SECRET_KEY CFG_NODE_PORT CFG_PANEL_IP CFG_INSTALL_XRAY CFG_DOMAIN CFG_CERT_TYPE CFG_CLOUDFLARE_TOKEN CFG_CADDY_PORT CFG_APPLY_NETWORK CFG_SETUP_UFW CFG_INSTALL_FAIL2BAN CFG_INSTALL_NETBIRD CFG_NETBIRD_SETUP_KEY CFG_INSTALL_MONITORING CFG_INSTANCE_NAME CFG_GRAFANA_IP NON_INTERACTIVE"
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[[:space:]]*# ]]; then continue; fi
             if [ -z "$key" ]; then continue; fi
@@ -3396,6 +3416,19 @@ collect_api_inputs() {
     fi
 
     if [ "${NON_INTERACTIVE:-false}" != true ]; then
+        echo -e "  ${WHITE}Роль сервера в сети:${NC}"
+        echo -e "    ${ORANGE}1)${NC} Выходная нода (Exit Node)      ${GRAPHITE}зарубежный сервер + WARP для Gemini/всех ИИ${NC}"
+        echo -e "    ${ORANGE}2)${NC} РФ-мост / Каскад (Relay Node)  ${GRAPHITE}вход в РФ -> Зарубежная нода (YouTube + .ru напрямую)${NC}"
+        local def_role_num="1"
+        [ "${CFG_NODE_ROLE:-exit}" = "relay" ] && def_role_num="2"
+        local role_choice="$def_role_num"
+        prompt_choice "Выберите роль сервера [1-2, Enter=${def_role_num}]: " 2 role_choice "$def_role_num"
+        if [ "$role_choice" = "2" ]; then
+            CFG_NODE_ROLE="relay"
+        else
+            CFG_NODE_ROLE="exit"
+        fi
+
         local input_xpath=""
         read -p "  ${ORANGE}>${NC} Путь XHTTP (XHTTP_PATH) [${XHTTP_PATH}]: " -r input_xpath
         XHTTP_PATH="${input_xpath:-${XHTTP_PATH}}"
@@ -3403,10 +3436,59 @@ collect_api_inputs() {
             XHTTP_PATH="/${XHTTP_PATH}"
         fi
 
-        if prompt_yn "Использовать Cloudflare CDN (оранжевое облако, packet-up) для XHTTP-резерва (y/n)? " "${CFG_XHTTP_CDN:-y}"; then
-            CFG_XHTTP_CDN="y"
-        else
+        if [ "$CFG_NODE_ROLE" = "relay" ]; then
             CFG_XHTTP_CDN="n"
+            CFG_ENABLE_WARP="n"
+            echo -e "\n  ${ORANGE}${BOLD}Настройка каскада РФ-мост ──► Зарубежная нода (Exit Node):${NC}"
+            echo -e "  ${GRAPHITE}Подсказка: на зарубежной ноде параметры лежат в /var/lib/node-mgr/remnawave-api.env${NC}"
+            while [ -z "${RELAY_EXIT_ADDRESS:-}" ]; do
+                read -p "  ${ORANGE}>${NC} Домен или IP зарубежной ноды (RELAY_EXIT_ADDRESS): " -r RELAY_EXIT_ADDRESS
+                RELAY_EXIT_ADDRESS=$(echo "$RELAY_EXIT_ADDRESS" | tr -d '[:space:]' | sed 's|^https\?://||;s|/.*$||')
+            done
+            if [ -z "${RELAY_EXIT_SNI:-}" ]; then
+                read -p "  ${ORANGE}>${NC} SNI / SELF_STEAL_DOMAIN зарубежной ноды [${RELAY_EXIT_ADDRESS}]: " -r RELAY_EXIT_SNI
+                RELAY_EXIT_SNI="${RELAY_EXIT_SNI:-$RELAY_EXIT_ADDRESS}"
+                RELAY_EXIT_SNI=$(echo "$RELAY_EXIT_SNI" | tr -d '[:space:]')
+            fi
+            read -p "  ${ORANGE}>${NC} Порт зарубежной ноды [${RELAY_EXIT_PORT:-443}]: " -r input_rport
+            RELAY_EXIT_PORT="${input_rport:-${RELAY_EXIT_PORT:-443}}"
+            while [ -z "${RELAY_EXIT_UUID:-}" ]; do
+                read -p "  ${ORANGE}>${NC} UUID сервисного юзера (bridge-relay) в панели: " -r RELAY_EXIT_UUID
+                RELAY_EXIT_UUID=$(echo "$RELAY_EXIT_UUID" | tr -d '[:space:]')
+            done
+            while [ -z "${RELAY_EXIT_PBK:-}" ]; do
+                read -p "  ${ORANGE}>${NC} Reality Public Key зарубежной ноды (REALITY_PUBLIC_KEY): " -r RELAY_EXIT_PBK
+                RELAY_EXIT_PBK=$(echo "$RELAY_EXIT_PBK" | tr -d '[:space:]')
+            done
+            while [ -z "${RELAY_EXIT_SID:-}" ]; do
+                read -p "  ${ORANGE}>${NC} Reality Short ID зарубежной ноды (REALITY_SHORT_ID): " -r RELAY_EXIT_SID
+                RELAY_EXIT_SID=$(echo "$RELAY_EXIT_SID" | tr -d '[:space:]')
+            done
+
+            if prompt_yn "Пускать YouTube напрямую (DIRECT) с РФ-моста (без рекламы)? (y/n): " "${CFG_RELAY_YOUTUBE_DIRECT:-y}"; then
+                CFG_RELAY_YOUTUBE_DIRECT="y"
+                local yt_chk=""
+                yt_chk=$(curl -sS -I --tlsv1.3 --connect-timeout 4 --max-time 6 "https://www.youtube.com" 2>/dev/null | head -1 | tr -d '\r' || true)
+                if echo "$yt_chk" | grep -qE "HTTP/(2|1\.1) (200|301|302)"; then
+                    log_success "Прямой доступ к YouTube с этого РФ-сервера проверен: ${yt_chk}"
+                else
+                    log_warning "Прямой запрос к youtube.com с этого сервера не ответил (${yt_chk:-timeout}) — проверьте ТСПУ хостера."
+                fi
+            else
+                CFG_RELAY_YOUTUBE_DIRECT="n"
+            fi
+
+            if prompt_yn "Пускать российские сайты (.ru/.рф/geoip:ru) напрямую с РФ-моста? (y/n): " "${CFG_RELAY_RU_DIRECT:-y}"; then
+                CFG_RELAY_RU_DIRECT="y"
+            else
+                CFG_RELAY_RU_DIRECT="n"
+            fi
+        else
+            if prompt_yn "Использовать Cloudflare CDN (оранжевое облако, packet-up) для XHTTP-резерва (y/n)? " "${CFG_XHTTP_CDN:-y}"; then
+                CFG_XHTTP_CDN="y"
+            else
+                CFG_XHTTP_CDN="n"
+            fi
         fi
 
         echo -e "  ${WHITE}uTLS Fingerprint хостов в подписке (анти-детект ТСПУ):${NC}"
@@ -3430,13 +3512,20 @@ collect_api_inputs() {
             *) CFG_FINGERPRINT="randomized" ;;
         esac
 
-        if prompt_yn "Маршрутизировать Gemini и OpenAI/ChatGPT через Cloudflare WARP (y/n)? " "${CFG_ENABLE_WARP:-y}"; then
-            CFG_ENABLE_WARP="y"
-        else
-            CFG_ENABLE_WARP="n"
+        if [ "$CFG_NODE_ROLE" != "relay" ]; then
+            if prompt_yn "Маршрутизировать Gemini и все ИИ (OpenAI/Claude/Perplexity/Grok) через WARP (y/n)? " "${CFG_ENABLE_WARP:-y}"; then
+                CFG_ENABLE_WARP="y"
+            else
+                CFG_ENABLE_WARP="n"
+            fi
         fi
     fi
     CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
+    if [ "${CFG_NODE_ROLE:-exit}" = "relay" ]; then
+        RELAY_EXIT_SNI="${RELAY_EXIT_SNI:-$RELAY_EXIT_ADDRESS}"
+        RELAY_EXIT_PORT="${RELAY_EXIT_PORT:-443}"
+        CFG_ENABLE_WARP="n"
+    fi
 
     if [ -z "${SELF_STEAL_PORT:-}" ]; then
         SELF_STEAL_PORT="$DEFAULT_PORT"
@@ -3478,8 +3567,22 @@ automate_remnawave_api() {
     local xhttp_port="${XHTTP_INBOUND_PORT:-$DEFAULT_XHTTP_PORT}"
     local host_fp="${CFG_FINGERPRINT:-randomized}"
     local xhttp_cdn=false
-    if [[ "${CFG_XHTTP_CDN:-y}" =~ ^[Yy]$ ]]; then
+    if [[ "${CFG_XHTTP_CDN:-y}" =~ ^[Yy]$ ]] && [ "${CFG_NODE_ROLE:-exit}" != "relay" ]; then
         xhttp_cdn=true
+    fi
+    local is_relay=false r_yt_direct=false r_ru_direct=false
+    local r_addr="${RELAY_EXIT_ADDRESS:-}" r_sni="${RELAY_EXIT_SNI:-${RELAY_EXIT_ADDRESS:-}}"
+    local r_port="${RELAY_EXIT_PORT:-443}" r_uuid="${RELAY_EXIT_UUID:-}"
+    local r_pbk="${RELAY_EXIT_PBK:-}" r_sid="${RELAY_EXIT_SID:-}" r_fp="${RELAY_EXIT_FP:-chrome}"
+    if [ "${CFG_NODE_ROLE:-exit}" = "relay" ]; then
+        is_relay=true
+        if [ -z "$r_addr" ] || [ -z "$r_uuid" ] || [ -z "$r_pbk" ] || [ -z "$r_sid" ]; then
+            log_error "Для режима РФ-моста (CFG_NODE_ROLE=relay) обязательны: RELAY_EXIT_ADDRESS, RELAY_EXIT_UUID, RELAY_EXIT_PBK, RELAY_EXIT_SID!"
+            STATUS_API="ошибка"
+            return 1
+        fi
+        [[ "${CFG_RELAY_YOUTUBE_DIRECT:-y}" =~ ^[Yy]$ ]] && r_yt_direct=true
+        [[ "${CFG_RELAY_RU_DIRECT:-y}" =~ ^[Yy]$ ]] && r_ru_direct=true
     fi
     DETAIL_XHTTP_DOMAIN="$xhttp_dom"
 
@@ -3495,10 +3598,12 @@ automate_remnawave_api() {
     local vision_tag="VLESS_REALITY_${upper_node_name:-NODE}"
     local xhttp_tag="VLESS_XHTTP_${upper_node_name:-NODE}"
 
-    # Развертывание локального Cloudflare WARP SOCKS5 (caomingjun/warp -> 127.0.0.1:40000) для Gemini + OpenAI
+    # На Exit Node запускаем локальный WARP SOCKS5 (на РФ-мосте WARP не нужен — он работает на зарубежке)
     local warp_active=false
     local warp_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
-    if [[ "${CFG_ENABLE_WARP:-y}" =~ ^[Yy]$ ]]; then
+    if [ "$is_relay" = true ]; then
+        STATUS_WARP="на зарубежной ноде (relay)"
+    elif [[ "${CFG_ENABLE_WARP:-y}" =~ ^[Yy]$ ]]; then
         if deploy_warp_proxy; then
             warp_active=true
         fi
@@ -3514,10 +3619,14 @@ automate_remnawave_api() {
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4e5f60718")
 
     # ── ШАГ 1: Создание или обновление Config Profile (/api/config-profiles) ─
-    log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}' (Vision :${vision_port} + XHTTP TLS :${xhttp_port}${warp_active:+ + WARP SOCKS5 :${warp_port}})..."
+    if [ "$is_relay" = true ]; then
+        log_info "Шаг 1/3: Синхронизация Config Profile РФ-моста '${profile_name}' (-> ${r_addr}:${r_port}, YouTube DIRECT=${r_yt_direct}, RU DIRECT=${r_ru_direct})..."
+    else
+        log_info "Шаг 1/3: Синхронизация Config Profile '${profile_name}' (Vision :${vision_port} + XHTTP TLS :${xhttp_port}${warp_active:+ + WARP SOCKS5 :${warp_port}})..."
+    fi
     local profile_payload profile_resp="" profile_uuid="" vision_inbound_uuid="" xhttp_inbound_uuid=""
 
-    # Формируем JSON с двумя инбаундами за Caddy L4 и опциональным WARP SOCKS5 outbound (127.0.0.1:40000)
+    # Формируем JSON для Exit Node (с WARP SOCKS5 для всех ИИ) или Relay Node (РФ-мост -> TO_FOREIGN + YouTube/.ru DIRECT)
     profile_payload=$(jq -n \
         --arg name "$profile_name" \
         --arg v_tag "$vision_tag" \
@@ -3535,6 +3644,16 @@ automate_remnawave_api() {
         --arg sid "$short_id" \
         --argjson use_warp "$warp_active" \
         --argjson w_port "$warp_port" \
+        --argjson is_relay "$is_relay" \
+        --arg r_addr "$r_addr" \
+        --argjson r_port "$r_port" \
+        --arg r_uuid "$r_uuid" \
+        --arg r_sni "$r_sni" \
+        --arg r_pbk "$r_pbk" \
+        --arg r_sid "$r_sid" \
+        --arg r_fp "$r_fp" \
+        --argjson r_yt_direct "$r_yt_direct" \
+        --argjson r_ru_direct "$r_ru_direct" \
         '{
             name: $name,
             config: {
@@ -3620,7 +3739,38 @@ automate_remnawave_api() {
                     }
                 ],
                 outbounds: (
-                    [
+                    (if $is_relay then [
+                        {
+                            tag: "TO_FOREIGN",
+                            protocol: "vless",
+                            settings: {
+                                vnext: [
+                                    {
+                                        address: $r_addr,
+                                        port: $r_port,
+                                        users: [
+                                            {
+                                                id: $r_uuid,
+                                                encryption: "none",
+                                                flow: "xtls-rprx-vision"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            streamSettings: {
+                                network: "raw",
+                                security: "reality",
+                                realitySettings: {
+                                    serverName: $r_sni,
+                                    fingerprint: $r_fp,
+                                    password: $r_pbk,
+                                    shortId: $r_sid,
+                                    spiderX: "/"
+                                }
+                            }
+                        }
+                    ] else [] end) + [
                         {
                             tag: "DIRECT",
                             protocol: "freedom"
@@ -3629,7 +3779,7 @@ automate_remnawave_api() {
                             tag: "BLOCK",
                             protocol: "blackhole"
                         }
-                    ] + (if $use_warp then [
+                    ] + (if ($use_warp and ($is_relay | not)) then [
                         {
                             tag: "WARP",
                             protocol: "socks",
@@ -3672,7 +3822,34 @@ automate_remnawave_api() {
                                 ],
                                 outboundTag: "DIRECT"
                             }
-                        ] + (if $use_warp then [
+                        ] + (if ($is_relay and $r_yt_direct) then [
+                            {
+                                domain: [
+                                    "geosite:youtube",
+                                    "domain:youtube.com",
+                                    "domain:youtu.be",
+                                    "domain:googlevideo.com",
+                                    "domain:ytimg.com",
+                                    "domain:ggpht.com",
+                                    "domain:youtubei.googleapis.com"
+                                ],
+                                outboundTag: "DIRECT"
+                            }
+                        ] else [] end) + (if ($is_relay and $r_ru_direct) then [
+                            {
+                                domain: [
+                                    "geosite:category-ru",
+                                    "regexp:\\.ru$",
+                                    "regexp:\\.рф$",
+                                    "regexp:\\.su$"
+                                ],
+                                outboundTag: "DIRECT"
+                            },
+                            {
+                                ip: ["geoip:ru"],
+                                outboundTag: "DIRECT"
+                            }
+                        ] else [] end) + (if ($use_warp and ($is_relay | not)) then [
                             {
                                 domain: [
                                     "domain:gemini.google.com",
@@ -3698,7 +3875,17 @@ automate_remnawave_api() {
                                     "domain:oaistatic.com",
                                     "domain:oaiusercontent.com",
                                     "domain:auth0.openai.com",
-                                    "domain:sora.com"
+                                    "domain:sora.com",
+                                    "domain:claude.ai",
+                                    "domain:anthropic.com",
+                                    "domain:claude.com",
+                                    "domain:perplexity.ai",
+                                    "domain:grok.com",
+                                    "domain:x.ai",
+                                    "domain:copilot.microsoft.com",
+                                    "domain:cursor.com",
+                                    "domain:cursor.sh",
+                                    "domain:poe.com"
                                 ],
                                 outboundTag: "WARP"
                             }
@@ -3919,8 +4106,12 @@ automate_remnawave_api() {
     local vision_host_payload xhttp_host_payload host_resp="" host_uuid="" xhost_resp="" xhost_uuid=""
 
     if [ -n "$vision_inbound_uuid" ]; then
+        local vision_remark="${NODE_NAME} [Reality]"
+        if [ "$is_relay" = true ]; then
+            vision_remark="${NODE_NAME} [RU-Bridge]"
+        fi
         vision_host_payload=$(jq -n \
-            --arg remark "${NODE_NAME} [Reality]" \
+            --arg remark "$vision_remark" \
             --arg addr "$SELF_STEAL_DOMAIN" \
             --arg sni "$SELF_STEAL_DOMAIN" \
             --arg fp "$host_fp" \
@@ -4007,6 +4198,15 @@ XHTTP_HOST_UUID="${DETAIL_XHTTP_HOST_UUID}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN}"
 XHTTP_STEAL_DOMAIN="${xhttp_dom}"
 XHTTP_PATH="${xhttp_path}"
+CFG_NODE_ROLE="$([ "$is_relay" = true ] && echo "relay" || echo "exit")"
+RELAY_EXIT_ADDRESS="${r_addr}"
+RELAY_EXIT_SNI="${r_sni}"
+RELAY_EXIT_PORT="${r_port}"
+RELAY_EXIT_UUID="${r_uuid}"
+RELAY_EXIT_PBK="${r_pbk}"
+RELAY_EXIT_SID="${r_sid}"
+CFG_RELAY_YOUTUBE_DIRECT="$([ "$r_yt_direct" = true ] && echo "y" || echo "n")"
+CFG_RELAY_RU_DIRECT="$([ "$r_ru_direct" = true ] && echo "y" || echo "n")"
 CFG_XHTTP_CDN="$([ "$xhttp_cdn" = true ] && echo "y" || echo "n")"
 CFG_FINGERPRINT="${host_fp}"
 XHTTP_CERT_FILE="${xhttp_cert_file}"
@@ -4827,20 +5027,47 @@ run_verify_stack() {
         fi
     fi
 
-    local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
-    if is_container_running "$WARP_CONTAINER_NAME"; then
-        local w_trace=""
-        w_trace=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 6 --max-time 10 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
-        if echo "$w_trace" | grep -qE '^warp=(on|plus)'; then
-            local w_ip w_colo
-            w_ip=$(echo "$w_trace" | awk -F= '/^ip=/{print $2; exit}')
-            w_colo=$(echo "$w_trace" | awk -F= '/^colo=/{print $2; exit}')
-            box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare WARP SOCKS5 (127.0.0.1:${w_port}): warp=on (IP: ${w_ip:-?}, DC: ${w_colo:-?})"
-        else
-            box_row "${RED}${BOLD}[ FAIL ]${NC} Контейнер ${WARP_CONTAINER_NAME} запущен, но SOCKS5 127.0.0.1:${w_port} не отвечает warp=on (node-mgr logs warp)"
+    local n_role
+    n_role=$(get_saved_node_role)
+    if [ "$n_role" = "relay" ]; then
+        local r_ex_addr="" r_ex_port="443"
+        if [ -f "$API_STATE_FILE" ]; then
+            r_ex_addr=$(grep -E '^RELAY_EXIT_ADDRESS=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || true)
+            r_ex_port=$(grep -E '^RELAY_EXIT_PORT=' "$API_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"'\''' || echo "443")
         fi
+        r_ex_addr="${r_ex_addr:-${RELAY_EXIT_ADDRESS:-}}"
+        r_ex_port="${r_ex_port:-443}"
+        if [ -n "$r_ex_addr" ]; then
+            if timeout 4 bash -c "</dev/tcp/${r_ex_addr}/${r_ex_port}" 2>/dev/null; then
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} Каскад РФ-мост -> Зарубежная нода (${r_ex_addr}:${r_ex_port}): TCP доступен"
+            else
+                box_row "${RED}${BOLD}[ FAIL ]${NC} Каскад РФ-мост -> Зарубежная нода (${r_ex_addr}:${r_ex_port}): порт НЕ доступен"
+            fi
+        fi
+        local yt_direct_probe=""
+        yt_direct_probe=$(curl -sS -I --tlsv1.3 --connect-timeout 4 --max-time 6 "https://www.youtube.com" 2>/dev/null | head -1 | tr -d '\r' || true)
+        if echo "$yt_direct_probe" | grep -qE "HTTP/(2|1\.1) (200|301|302)"; then
+            box_row "${GREEN}${BOLD}[ PASS ]${NC} Прямой YouTube с РФ-моста (без рекламы): ${yt_direct_probe}"
+        else
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} Прямой YouTube с РФ-моста: ${yt_direct_probe:-таймаут (возможен ТСПУ хостера)}"
+        fi
+        box_row "${CYAN}${BOLD}[ INFO ]${NC} Режим Relay: WARP для Gemini/ИИ работает на зарубежной выходной ноде"
     else
-        box_row "${YELLOW}${BOLD}[ WARN ]${NC} Cloudflare WARP SOCKS5 (${WARP_CONTAINER_NAME}) не запущен (запустите: node-mgr warp)"
+        local w_port="${WARP_SOCKS_PORT:-$DEFAULT_WARP_SOCKS_PORT}"
+        if is_container_running "$WARP_CONTAINER_NAME"; then
+            local w_trace=""
+            w_trace=$(curl -fsSL --socks5-hostname "127.0.0.1:${w_port}" --connect-timeout 6 --max-time 10 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+            if echo "$w_trace" | grep -qE '^warp=(on|plus)'; then
+                local w_ip w_colo
+                w_ip=$(echo "$w_trace" | awk -F= '/^ip=/{print $2; exit}')
+                w_colo=$(echo "$w_trace" | awk -F= '/^colo=/{print $2; exit}')
+                box_row "${GREEN}${BOLD}[ PASS ]${NC} Cloudflare WARP SOCKS5 (127.0.0.1:${w_port}): warp=on (IP: ${w_ip:-?}, DC: ${w_colo:-?})"
+            else
+                box_row "${RED}${BOLD}[ FAIL ]${NC} Контейнер ${WARP_CONTAINER_NAME} запущен, но SOCKS5 127.0.0.1:${w_port} не отвечает warp=on (node-mgr logs warp)"
+            fi
+        else
+            box_row "${YELLOW}${BOLD}[ WARN ]${NC} Cloudflare WARP SOCKS5 (${WARP_CONTAINER_NAME}) не запущен (запустите: node-mgr warp)"
+        fi
     fi
     box_bottom
     echo
@@ -5025,6 +5252,7 @@ dry_run() {
     box_kv "IP узла / SSH порт" "${NODE_ADDRESS:-$NODE_IP} | SSH: $(detect_ssh_port)/tcp"
     box_kv "Remnawave API URL" "${REMNAWAVE_API_URL:-не задан (интерактивный запрос)}"
     box_kv "Домен Vision (:10443)" "${SELF_STEAL_DOMAIN:-$(get_saved_caddy_domain)} -> Selfsteal 127.0.0.1:${SELF_STEAL_PORT}"
+    box_kv "Роль сервера" "$([ "${CFG_NODE_ROLE:-exit}" = "relay" ] && echo "РФ-мост / Relay (-> ${RELAY_EXIT_ADDRESS:-?}:${RELAY_EXIT_PORT:-443}, YouTube DIRECT=${CFG_RELAY_YOUTUBE_DIRECT:-y})" || echo "Exit Node (зарубежная нода + WARP для всех ИИ)")"
     box_kv "Домен XHTTP TLS (:10444)" "${XHTTP_STEAL_DOMAIN:-$(get_saved_xhttp_domain)} (path: ${XHTTP_PATH:-auto}, CDN=${CFG_XHTTP_CDN:-y}, certs: /certs:ro)"
     box_kv "Анти-детект (DPI/uTLS)" "fp=${CFG_FINGERPRINT:-randomized} | maxTimeDiff=300s | xPadding=100-1000 | rejectUnknownSni=true"
     box_kv "WARP AI Outbound" "CFG_ENABLE_WARP=${CFG_ENABLE_WARP:-y} (Gemini + OpenAI -> WireGuard WARP)"
@@ -5437,6 +5665,15 @@ XHTTP_STEAL_DOMAIN="$(get_saved_xhttp_domain)"
 XHTTP_PATH="$(get_saved_xhttp_path)"
 CFG_XHTTP_CDN="$(get_saved_xhttp_cdn)"
 CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
+CFG_NODE_ROLE="$(get_saved_node_role)"
+RELAY_EXIT_ADDRESS="${RELAY_EXIT_ADDRESS}"
+RELAY_EXIT_SNI="${RELAY_EXIT_SNI}"
+RELAY_EXIT_PORT="${RELAY_EXIT_PORT:-443}"
+RELAY_EXIT_UUID="${RELAY_EXIT_UUID}"
+RELAY_EXIT_PBK="${RELAY_EXIT_PBK}"
+RELAY_EXIT_SID="${RELAY_EXIT_SID}"
+CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-y}"
+CFG_RELAY_RU_DIRECT="${CFG_RELAY_RU_DIRECT:-y}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
 XHTTP_INBOUND_PORT=${XHTTP_INBOUND_PORT}
@@ -5542,8 +5779,9 @@ show_help() {
     CFG_XHTTP_CDN="y"                       # y = Cloudflare CDN резерв (оранжевое облако, mode: packet-up)
     CFG_FINGERPRINT="randomized"            # randomized | chrome | firefox | ios
     SELF_STEAL_PORT="9443"
-    CFG_ENABLE_WARP="y"          # y = маршрутизировать Gemini + OpenAI через WARP WireGuard
-    CFG_CERT_TYPE="1"            # 1 = Let's Encrypt HTTP-01 (:80), 2 = Cloudflare DNS-01
+    CFG_ENABLE_WARP="y"          # y = локальный WARP SOCKS5 (127.0.0.1:40000) для Gemini + всех ИИ
+    CFG_NODE_ROLE="exit"         # exit = зарубежная нода | relay = РФ-мост (-> RELAY_EXIT_*)
+    CFG_CERT_TYPE="1"            # 1 = Let's Encrypt HTTP-01 (:80), 2 = Cloudflare DNS-01 (закрывает :80)
     CFG_CLOUDFLARE_TOKEN="..."   # API-токен Cloudflare (при CFG_CERT_TYPE=2)
 HELP
     echo
