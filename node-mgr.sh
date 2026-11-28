@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.1 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.2 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.7.1"
+readonly SCRIPT_VERSION="4.7.2"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -4861,6 +4861,11 @@ services:
       - /dev/disk/:/dev/disk:ro
     devices:
       - /dev/kmsg
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9101/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: "json-file"
       options:
