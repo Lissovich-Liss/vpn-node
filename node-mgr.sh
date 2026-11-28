@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.7.3 (node-mgr)
+#  LissVPN Node Orchestrator & Diagnostic Toolkit v4.8.0 (node-mgr)
 #  Repository: https://github.com/Lissovich-Liss/vpn-node
 #  Remnawave API Auto-Deploy • Caddy L4 (Reality Vision + XHTTP TLS + /certs:ro)
 #  Cloudflare WARP AI Routing (Gemini + OpenAI) • Anti-Detect • Highload + CAKE
@@ -38,7 +38,7 @@ readonly DIM=$'\033[2m'
 # ═══════════════════════════════════════════════════════════════════
 #  Константы, пути и стейт диагностики
 # ═══════════════════════════════════════════════════════════════════
-readonly SCRIPT_VERSION="4.7.3"
+readonly SCRIPT_VERSION="4.8.0"
 readonly BIN_PATH="/usr/local/bin/node-mgr"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/Lissovich-Liss/vpn-node/main/node-mgr.sh"
 readonly INSTALL_LOG="/var/log/remnanode-install.log"
@@ -109,8 +109,8 @@ NODE_ADDRESS="${NODE_ADDRESS:-}"
 SELF_STEAL_DOMAIN="${SELF_STEAL_DOMAIN:-}"
 XHTTP_STEAL_DOMAIN="${XHTTP_STEAL_DOMAIN:-}"
 XHTTP_PATH="${XHTTP_PATH:-}"
-CFG_XHTTP_CDN="${CFG_XHTTP_CDN:-y}"
-CFG_FINGERPRINT="${CFG_FINGERPRINT:-randomized}"
+CFG_XHTTP_CDN="${CFG_XHTTP_CDN:-n}"
+CFG_FINGERPRINT="${CFG_FINGERPRINT:-chrome}"
 CFG_HOST_TAG="${CFG_HOST_TAG:-}"
 CFG_HOST_HIDDEN="${CFG_HOST_HIDDEN:-n}"
 SELF_STEAL_PORT="${SELF_STEAL_PORT:-$DEFAULT_PORT}"
@@ -126,7 +126,7 @@ RELAY_EXIT_UUID="${RELAY_EXIT_UUID:-}"
 RELAY_EXIT_PBK="${RELAY_EXIT_PBK:-}"
 RELAY_EXIT_SID="${RELAY_EXIT_SID:-}"
 RELAY_EXIT_FP="${RELAY_EXIT_FP:-chrome}"
-CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-y}"
+CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-n}"
 CFG_RELAY_RU_DIRECT="${CFG_RELAY_RU_DIRECT:-y}"
 
 # Cloudflare WARP SOCKS5 Proxy (caomingjun/warp -> 127.0.0.1:40000 для Gemini + всех ИИ)
@@ -3844,7 +3844,7 @@ automate_remnawave_api() {
                                 outboundTag: "BLOCK"
                             },
                             {
-                                ip: ["geoip:private"],
+                                ip: ["geoip:private", "::/0"],
                                 outboundTag: "BLOCK"
                             },
                             {
@@ -3889,6 +3889,33 @@ automate_remnawave_api() {
                         ] else [] end) + (if ($use_warp and ($is_relay | not)) then [
                             {
                                 domain: [
+                                    "geosite:youtube",
+                                    "domain:youtube.com",
+                                    "domain:youtu.be",
+                                    "domain:googlevideo.com",
+                                    "domain:ytimg.com",
+                                    "domain:ggpht.com",
+                                    "domain:youtubei.googleapis.com"
+                                ],
+                                outboundTag: "DIRECT"
+                            },
+                            {
+                                domain: [
+                                    "geosite:google",
+                                    "geosite:google-gemini",
+                                    "geosite:openai",
+                                    "geosite:anthropic",
+                                    "domain:antigravity.google",
+                                    "domain:antigravity-unleash.goog",
+                                    "domain:goog",
+                                    "domain:google",
+                                    "domain:cloudcode-pa.googleapis.com",
+                                    "domain:daily-cloudcode-pa.googleapis.com",
+                                    "domain:autopush-cloudcode-pa.googleapis.com",
+                                    "domain:staging-cloudcode-pa.googleapis.com",
+                                    "domain:cloudaicompanion.googleapis.com",
+                                    "domain:codeassist.google.com",
+                                    "domain:aiplatform.googleapis.com",
                                     "domain:gemini.google.com",
                                     "domain:aistudio.google.com",
                                     "domain:generativelanguage.googleapis.com",
@@ -3907,6 +3934,8 @@ automate_remnawave_api() {
                                     "domain:bard.google.com",
                                     "domain:jules.google.com",
                                     "domain:opal.google",
+                                    "domain:idx.dev",
+                                    "domain:firebase.studio",
                                     "domain:openai.com",
                                     "domain:chatgpt.com",
                                     "domain:oaistatic.com",
@@ -4645,7 +4674,7 @@ maxretry = 4
 bantime = 1h
 
 [caddy-status]
-enabled = true
+enabled = false
 port = 80,443
 filter = caddy-status
 backend = auto
@@ -4655,7 +4684,7 @@ findtime = 10m
 bantime = 1h
 
 [portscan]
-enabled = true
+enabled = false
 filter = portscan
 backend = ${portscan_backend}
 ${portscan_extra}
@@ -5744,7 +5773,7 @@ RELAY_EXIT_PORT="${RELAY_EXIT_PORT:-443}"
 RELAY_EXIT_UUID="${RELAY_EXIT_UUID}"
 RELAY_EXIT_PBK="${RELAY_EXIT_PBK}"
 RELAY_EXIT_SID="${RELAY_EXIT_SID}"
-CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-y}"
+CFG_RELAY_YOUTUBE_DIRECT="${CFG_RELAY_YOUTUBE_DIRECT:-n}"
 CFG_RELAY_RU_DIRECT="${CFG_RELAY_RU_DIRECT:-y}"
 SELF_STEAL_PORT=$(get_saved_caddy_port)
 VISION_INBOUND_PORT=${VISION_INBOUND_PORT}
